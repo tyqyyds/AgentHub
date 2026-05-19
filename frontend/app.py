@@ -173,8 +173,15 @@ def start_websocket(user_intent: str = ""):
                     }))
             
             # 使用 nest_asyncio 安全运行异步任务
+            try:
+                loop = asyncio.get_event_loop()
+            except RuntimeError:
+                # 如果没有事件循环，应用 nest_asyncio 后重新获取
+                loop = asyncio.new_event_loop()
+                asyncio.set_event_loop(loop)
+            
             threading.Thread(
-                target=asyncio.run,
+                target=loop.run_until_complete,
                 args=(send_intent(),),
                 daemon=True
             ).start()
@@ -189,8 +196,15 @@ def start_websocket(user_intent: str = ""):
     async def run_receive_data():
         await receive_data(user_intent)
     
+    try:
+        loop = asyncio.get_event_loop()
+    except RuntimeError:
+        # 如果没有事件循环，应用 nest_asyncio 后重新获取
+        loop = asyncio.new_event_loop()
+        asyncio.set_event_loop(loop)
+    
     ws_thread = threading.Thread(
-        target=asyncio.run,
+        target=loop.run_until_complete,
         args=(run_receive_data(),),
         daemon=True
     )
