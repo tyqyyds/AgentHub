@@ -1,8 +1,9 @@
+from typing import Optional, List
 from fastapi import APIRouter, Depends, HTTPException
 from sqlalchemy.ext.asyncio import AsyncSession
 from pydantic import BaseModel
-from backend.database.connection import get_db_session
-from backend.database.models import AgentRegistry
+from ..database.connection import get_db_session
+from ..database.models import AgentRegistry
 
 router = APIRouter()
 
@@ -10,9 +11,9 @@ router = APIRouter()
 class AgentCreate(BaseModel):
     agent_id: str
     domain: str
-    ip: str = None
+    ip: Optional[str] = None
     a2a_endpoint: str
-    capabilities: list = None
+    capabilities: Optional[list] = None
 
 
 @router.post("/")
@@ -31,7 +32,7 @@ async def register_agent(agent: AgentCreate, db: AsyncSession = Depends(get_db_s
 
 
 @router.get("/")
-async def get_agents(domain: str = None, status: str = None, db: AsyncSession = Depends(get_db_session)):
+async def get_agents(domain: Optional[str] = None, status: Optional[str] = None, db: AsyncSession = Depends(get_db_session)):
     query = AgentRegistry.__table__.select()
     if domain:
         query = query.where(AgentRegistry.domain == domain)

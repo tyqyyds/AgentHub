@@ -1,6 +1,13 @@
+"""速率限制中间件 - 第6层安全防护
+
+README规范文件名: rate_limiter_middleware.py
+实际文件名: rate_limiter.py
+功能: 滑动窗口限流 + 角色限流（基于Redis）
+"""
+
 import redis
 import time
-from backend.core.config import settings
+from ..config import settings
 
 class RateLimiter:
     def __init__(self):

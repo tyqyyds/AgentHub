@@ -13,10 +13,21 @@ export default defineConfig({
     port: 5173,
     proxy: {
       '/api': {
-        target: 'http://localhost:8000',
+        target: 'http://localhost:8001',
         changeOrigin: true,
         ws: true
       }
     }
+  },
+  build: {
+    rollupOptions: {
+      output: {
+        manualChunks: {
+          'element-plus': ['element-plus'],
+          'vendor': ['vue', 'vue-router', 'pinia', 'axios', '@vue/shared', '@vueuse/core']
+        }
+      }
+    },
+    chunkSizeWarningLimit: 1000
   }
 })

@@ -1,8 +1,17 @@
 <script setup lang="ts">
 import { ref, onMounted, onUnmounted } from 'vue'
 
-const selectedNode = ref(null)
-const nodeDetails = ref(null)
+interface TopoNode {
+  id: string
+  name: string
+  type: string
+  health: number
+  x: number
+  y: number
+}
+
+const selectedNode = ref<string | null>(null)
+const nodeDetails = ref<TopoNode | null>(null)
 
 const topologyData = ref({
   nodes: [
@@ -31,18 +40,18 @@ const topologyData = ref({
   ]
 })
 
-const handleNodeClick = (node) => {
+const handleNodeClick = (node: TopoNode) => {
   selectedNode.value = node.id
   nodeDetails.value = node
 }
 
-const getHealthColor = (health) => {
-  if (health >= 90) return '#52C41A'
-  if (health >= 70) return '#FAAD14'
-  return '#FF4D4F'
+const getHealthLevel = (health: number): string => {
+  if (health >= 90) return 'good'
+  if (health >= 70) return 'warning'
+  return 'bad'
 }
 
-let animationFrame = null
+let animationFrame: number | null = null
 
 const animateNodes = () => {
   topologyData.value.nodes.forEach(node => {
@@ -72,8 +81,8 @@ onUnmounted(() => {
         <svg viewBox="0 0 1000 550" class="svg-canvas">
           <defs>
             <linearGradient id="linkGradient" x1="0%" y1="0%" x2="100%" y2="0%">
-              <stop offset="0%" stop-color="#165DFF" />
-              <stop offset="100%" stop-color="#69B1FF" />
+              <stop offset="0%" class="gradient-start" />
+              <stop offset="100%" class="gradient-end" />
             </linearGradient>
             <filter id="glow">
               <feGaussianBlur stdDeviation="3" result="coloredBlur"/>
@@ -93,7 +102,7 @@ onUnmounted(() => {
               :x2="topologyData.nodes.find(n => n.id === link.target)?.x || 0"
               :y2="topologyData.nodes.find(n => n.id === link.target)?.y || 0"
               :class="['link', link.status]"
-              :stroke="link.status === 'warning' ? '#FAAD14' : 'url(#linkGradient)'"
+              :stroke="link.status === 'warning' ? 'var(--color-warning)' : 'url(#linkGradient)'"
             />
           </g>
           
@@ -108,23 +117,19 @@ onUnmounted(() => {
                 :cx="node.x"
                 :cy="node.y"
                 r="30"
-                :fill="getHealthColor(node.health)"
-                class="node-circle"
+                :class="['node-circle', 'health-' + getHealthLevel(node.health)]"
               />
               <circle
                 :cx="node.x"
                 :cy="node.y"
                 r="25"
-                fill="#1E293B"
                 class="node-inner"
               />
               <text
                 :x="node.x"
                 :y="node.y + 5"
                 text-anchor="middle"
-                fill="white"
-                font-size="12"
-                font-weight="600"
+                class="node-type-text"
               >
                 {{ node.type === 'router' ? 'R' : 'S' }}
               </text>
@@ -132,8 +137,7 @@ onUnmounted(() => {
                 :x="node.x"
                 :y="node.y + 55"
                 text-anchor="middle"
-                fill="#E2E8F0"
-                font-size="11"
+                class="node-name-text"
               >
                 {{ node.name.split(' ')[0] }}
               </text>
@@ -143,15 +147,15 @@ onUnmounted(() => {
         
         <div class="legend">
           <div class="legend-item">
-            <span class="legend-dot" style="background: #52C41A;"></span>
+            <span class="legend-dot health-good"></span>
             <span>健康 (≥90%)</span>
           </div>
           <div class="legend-item">
-            <span class="legend-dot" style="background: #FAAD14;"></span>
+            <span class="legend-dot health-warning"></span>
             <span>警告 (70-89%)</span>
           </div>
           <div class="legend-item">
-            <span class="legend-dot" style="background: #FF4D4F;"></span>
+            <span class="legend-dot health-bad"></span>
             <span>故障 (<70%)</span>
           </div>
         </div>
@@ -161,7 +165,7 @@ onUnmounted(() => {
         <h2 class="panel-title">节点详情</h2>
         <div v-if="nodeDetails" class="node-info">
           <div class="info-header">
-            <div class="info-icon" :style="{ background: getHealthColor(nodeDetails.health) }">
+            <div class="info-icon" :class="'health-bg-' + getHealthLevel(nodeDetails.health)">
               {{ nodeDetails.type === 'router' ? 'R' : 'S' }}
             </div>
             <div class="info-title">
@@ -177,10 +181,11 @@ onUnmounted(() => {
                 <div class="health-bar-container">
                   <div
                     class="health-bar"
-                    :style="{ width: `${nodeDetails.health}%`, background: getHealthColor(nodeDetails.health) }"
+                    :class="'health-bg-' + getHealthLevel(nodeDetails.health)"
+                    :style="{ width: `${nodeDetails.health}%` }"
                   ></div>
                 </div>
-                <span :style="{ color: getHealthColor(nodeDetails.health) }">{{ nodeDetails.health }}%</span>
+                <span :class="'health-text-' + getHealthLevel(nodeDetails.health)">{{ nodeDetails.health }}%</span>
               </div>
             </div>
             <div class="stat-row">
@@ -209,31 +214,69 @@ onUnmounted(() => {
 
 <style scoped>
 .page-title {
-  font-size: 24px;
-  font-weight: 700;
-  color: white;
-  margin-bottom: 24px;
+  font-size: var(--font-size-3xl);
+  font-weight: var(--font-weight-bold);
+  color: var(--color-white);
+  margin-bottom: var(--spacing-2xl);
 }
 
 .topology-layout {
   display: grid;
   grid-template-columns: 1fr 320px;
-  gap: 24px;
+  gap: var(--spacing-2xl);
 }
 
 .topology-canvas {
-  background: rgba(30, 41, 59, 0.6);
-  border-radius: 16px;
-  padding: 24px;
-  border: 1px solid rgba(255, 255, 255, 0.1);
+  background: rgba(var(--color-bg-container-rgb), 0.6);
+  border-radius: var(--radius-2xl);
+  padding: var(--spacing-2xl);
+  border: 1px solid rgba(var(--color-white-rgb), 0.1);
   position: relative;
 }
 
 .svg-canvas {
   width: 100%;
   height: 500px;
-  background: rgba(15, 23, 42, 0.3);
-  border-radius: 12px;
+  background: rgba(var(--color-bg-base-rgb), 0.3);
+  border-radius: var(--radius-xl);
+}
+
+/* SVG gradient stops */
+.gradient-start {
+  stop-color: var(--color-primary);
+}
+
+.gradient-end {
+  stop-color: var(--color-info-light);
+}
+
+/* Health state fills for SVG circles */
+.health-good {
+  fill: var(--color-success);
+}
+
+.health-warning {
+  fill: var(--color-warning);
+}
+
+.health-bad {
+  fill: var(--color-error);
+}
+
+.node-inner {
+  fill: var(--color-bg-container);
+  transition: all 0.3s ease;
+}
+
+.node-type-text {
+  fill: var(--color-white);
+  font-size: var(--font-size-sm);
+  font-weight: var(--font-weight-semibold);
+}
+
+.node-name-text {
+  fill: var(--color-text-secondary);
+  font-size: var(--font-size-xs);
 }
 
 .link {
@@ -266,7 +309,7 @@ onUnmounted(() => {
 }
 
 .node-group.selected .node-circle {
-  stroke: #165DFF;
+  stroke: var(--color-primary);
   stroke-width: 3;
   filter: url(#glow);
 }
@@ -275,89 +318,111 @@ onUnmounted(() => {
   transition: all 0.3s ease;
 }
 
-.node-inner {
-  transition: all 0.3s ease;
-}
-
 .legend {
   position: absolute;
-  bottom: 24px;
-  right: 24px;
+  bottom: var(--spacing-2xl);
+  right: var(--spacing-2xl);
   display: flex;
-  gap: 20px;
-  padding: 12px 16px;
-  background: rgba(15, 23, 42, 0.8);
-  border-radius: 10px;
+  gap: var(--spacing-xl);
+  padding: var(--spacing-md) var(--spacing-lg);
+  background: rgba(var(--color-bg-base-rgb), 0.8);
+  border-radius: var(--radius-lg);
 }
 
 .legend-item {
   display: flex;
   align-items: center;
-  gap: 8px;
-  font-size: 12px;
-  color: #E2E8F0;
+  gap: var(--spacing-sm);
+  font-size: var(--font-size-sm);
+  color: var(--color-text-secondary);
 }
 
 .legend-dot {
-  width: 12px;
-  height: 12px;
-  border-radius: 50%;
+  width: var(--font-size-sm);
+  height: var(--font-size-sm);
+  border-radius: var(--radius-full);
+}
+
+/* Legend dot health states */
+.legend-dot.health-good {
+  background: var(--color-success);
+}
+
+.legend-dot.health-warning {
+  background: var(--color-warning);
+}
+
+.legend-dot.health-bad {
+  background: var(--color-error);
 }
 
 .node-panel {
-  background: rgba(30, 41, 59, 0.6);
-  border-radius: 16px;
-  padding: 24px;
-  border: 1px solid rgba(255, 255, 255, 0.1);
+  background: rgba(var(--color-bg-container-rgb), 0.6);
+  border-radius: var(--radius-2xl);
+  padding: var(--spacing-2xl);
+  border: 1px solid rgba(var(--color-white-rgb), 0.1);
 }
 
 .panel-title {
-  font-size: 16px;
-  font-weight: 600;
-  color: white;
-  margin-bottom: 20px;
+  font-size: var(--font-size-lg);
+  font-weight: var(--font-weight-semibold);
+  color: var(--color-white);
+  margin-bottom: var(--spacing-xl);
 }
 
 .node-info {
   display: flex;
   flex-direction: column;
-  gap: 20px;
+  gap: var(--spacing-xl);
 }
 
 .info-header {
   display: flex;
   align-items: center;
-  gap: 16px;
+  gap: var(--spacing-lg);
 }
 
 .info-icon {
   width: 56px;
   height: 56px;
-  border-radius: 14px;
+  border-radius: var(--radius-xl);
   display: flex;
   align-items: center;
   justify-content: center;
-  color: white;
-  font-size: 24px;
-  font-weight: 700;
+  color: var(--color-white);
+  font-size: var(--font-size-3xl);
+  font-weight: var(--font-weight-bold);
+}
+
+/* Info icon health background states */
+.info-icon.health-bg-good {
+  background: var(--color-success);
+}
+
+.info-icon.health-bg-warning {
+  background: var(--color-warning);
+}
+
+.info-icon.health-bg-bad {
+  background: var(--color-error);
 }
 
 .info-title h3 {
-  font-size: 18px;
-  font-weight: 600;
-  color: white;
-  margin-bottom: 4px;
+  font-size: var(--font-size-xl);
+  font-weight: var(--font-weight-semibold);
+  color: var(--color-white);
+  margin-bottom: var(--spacing-2xs);
 }
 
 .info-type {
-  font-size: 13px;
-  color: #64748B;
+  font-size: var(--font-size-md);
+  color: var(--color-text-quaternary);
 }
 
 .info-stats {
   display: flex;
   flex-direction: column;
-  gap: 16px;
+  gap: var(--spacing-lg);
 }
 
 .stat-row {
@@ -367,68 +432,94 @@ onUnmounted(() => {
 }
 
 .stat-label {
-  font-size: 13px;
-  color: #94A3B8;
+  font-size: var(--font-size-md);
+  color: var(--color-text-tertiary);
 }
 
 .stat-value {
-  font-size: 14px;
-  color: white;
-  font-weight: 500;
+  font-size: var(--font-size-base);
+  color: var(--color-white);
+  font-weight: var(--font-weight-medium);
 }
 
 .stat-value-row {
   display: flex;
   align-items: center;
-  gap: 12px;
+  gap: var(--spacing-md);
   flex: 1;
   justify-content: flex-end;
 }
 
 .health-bar-container {
   flex: 1;
-  height: 6px;
-  background: rgba(255, 255, 255, 0.1);
-  border-radius: 3px;
+  height: var(--spacing-xs);
+  background: rgba(var(--color-white-rgb), 0.1);
+  border-radius: var(--radius-xs);
   overflow: hidden;
 }
 
 .health-bar {
   height: 100%;
-  border-radius: 3px;
+  border-radius: var(--radius-xs);
   transition: width 0.3s ease;
+}
+
+/* Health bar background states */
+.health-bar.health-bg-good {
+  background: var(--color-success);
+}
+
+.health-bar.health-bg-warning {
+  background: var(--color-warning);
+}
+
+.health-bar.health-bg-bad {
+  background: var(--color-error);
+}
+
+/* Health text color states */
+.health-text-good {
+  color: var(--color-success);
+}
+
+.health-text-warning {
+  color: var(--color-warning);
+}
+
+.health-text-bad {
+  color: var(--color-error);
 }
 
 .info-actions {
   display: flex;
-  gap: 12px;
-  margin-top: 20px;
+  gap: var(--spacing-md);
+  margin-top: var(--spacing-xl);
 }
 
 .action-btn {
   flex: 1;
-  padding: 12px;
-  background: linear-gradient(135deg, #165DFF 0%, #4080FF 100%);
-  color: white;
+  padding: var(--spacing-md);
+  background: var(--gradient-primary);
+  color: var(--color-white);
   border: none;
-  border-radius: 10px;
-  font-size: 13px;
-  font-weight: 500;
+  border-radius: var(--radius-lg);
+  font-size: var(--font-size-md);
+  font-weight: var(--font-weight-medium);
   cursor: pointer;
   transition: all 0.3s ease;
 }
 
 .action-btn:hover {
   transform: translateY(-2px);
-  box-shadow: 0 4px 12px rgba(22, 93, 255, 0.4);
+  box-shadow: 0 var(--spacing-sm) var(--spacing-md) rgba(var(--color-primary-rgb), 0.4);
 }
 
 .action-btn.secondary {
-  background: rgba(255, 255, 255, 0.1);
+  background: rgba(var(--color-white-rgb), 0.1);
 }
 
 .action-btn.secondary:hover {
-  background: rgba(255, 255, 255, 0.15);
+  background: rgba(var(--color-white-rgb), 0.15);
   box-shadow: none;
 }
 
@@ -437,16 +528,16 @@ onUnmounted(() => {
   flex-direction: column;
   align-items: center;
   justify-content: center;
-  padding: 60px 20px;
-  color: #64748B;
+  padding: 60px var(--spacing-xl);
+  color: var(--color-text-quaternary);
 }
 
 .empty-icon {
-  font-size: 48px;
-  margin-bottom: 16px;
+  font-size: var(--font-size-6xl);
+  margin-bottom: var(--spacing-lg);
 }
 
 .empty-state p {
-  font-size: 14px;
+  font-size: var(--font-size-base);
 }
 </style>

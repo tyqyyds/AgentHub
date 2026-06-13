@@ -177,21 +177,21 @@ const statusOptions = [
 
 <style scoped>
 .page-title {
-  font-size: 24px;
-  font-weight: 700;
-  color: white;
-  margin-bottom: 24px;
+  font-size: var(--font-size-3xl);
+  font-weight: var(--font-weight-bold);
+  color: var(--color-white);
+  margin-bottom: var(--spacing-2xl);
 }
 
 .filter-bar {
   display: flex;
   justify-content: space-between;
   align-items: center;
-  margin-bottom: 24px;
-  padding: 16px 20px;
-  background: rgba(30, 41, 59, 0.6);
-  border-radius: 12px;
-  border: 1px solid rgba(255, 255, 255, 0.1);
+  margin-bottom: var(--spacing-2xl);
+  padding: var(--spacing-lg) var(--spacing-xl);
+  background: rgba(var(--color-bg-container-rgb), 0.6);
+  border-radius: var(--radius-xl);
+  border: 1px solid rgba(var(--color-white-rgb), 0.1);
 }
 
 .search-box {
@@ -201,56 +201,56 @@ const statusOptions = [
 
 .search-input {
   width: 100%;
-  padding: 12px 16px;
-  background: rgba(15, 23, 42, 0.5);
-  border: 2px solid rgba(255, 255, 255, 0.1);
-  border-radius: 10px;
-  color: white;
-  font-size: 14px;
+  padding: var(--spacing-md) var(--spacing-lg);
+  background: rgba(var(--color-bg-base-rgb), 0.5);
+  border: 2px solid rgba(var(--color-white-rgb), 0.1);
+  border-radius: var(--spacing-sm-md);
+  color: var(--color-white);
+  font-size: var(--font-size-base);
   transition: all 0.3s ease;
 }
 
 .search-input:focus {
   outline: none;
-  border-color: #165DFF;
-  box-shadow: 0 0 0 4px rgba(22, 93, 255, 0.1);
+  border-color: var(--color-primary);
+  box-shadow: 0 0 0 var(--spacing-sm) rgba(var(--color-primary-rgb), 0.1);
 }
 
 .search-input::placeholder {
-  color: #64748B;
+  color: var(--color-text-quaternary);
 }
 
 .filter-selects {
   display: flex;
-  gap: 12px;
+  gap: var(--spacing-md);
 }
 
 .filter-select {
-  padding: 12px 16px;
-  background: rgba(15, 23, 42, 0.5);
-  border: 2px solid rgba(255, 255, 255, 0.1);
-  border-radius: 10px;
-  color: white;
-  font-size: 14px;
+  padding: var(--spacing-md) var(--spacing-lg);
+  background: rgba(var(--color-bg-base-rgb), 0.5);
+  border: 2px solid rgba(var(--color-white-rgb), 0.1);
+  border-radius: var(--spacing-sm-md);
+  color: var(--color-white);
+  font-size: var(--font-size-base);
   cursor: pointer;
   transition: all 0.3s ease;
 }
 
 .filter-select:focus {
   outline: none;
-  border-color: #165DFF;
+  border-color: var(--color-primary);
 }
 
 .filter-select option {
-  background: #1E293B;
-  color: white;
+  background: var(--color-bg-container);
+  color: var(--color-white);
 }
 
 .logs-table-container {
-  background: rgba(30, 41, 59, 0.6);
-  border-radius: 16px;
-  padding: 20px;
-  border: 1px solid rgba(255, 255, 255, 0.1);
+  background: rgba(var(--color-bg-container-rgb), 0.6);
+  border-radius: var(--radius-2xl);
+  padding: var(--spacing-xl);
+  border: 1px solid rgba(var(--color-white-rgb), 0.1);
   overflow-x: auto;
 }
 
@@ -260,49 +260,49 @@ const statusOptions = [
 }
 
 .logs-table thead tr {
-  border-bottom: 2px solid rgba(255, 255, 255, 0.1);
+  border-bottom: 2px solid rgba(var(--color-white-rgb), 0.1);
 }
 
 .logs-table th {
   text-align: left;
-  padding: 14px 16px;
-  font-size: 13px;
-  font-weight: 600;
-  color: #94A3B8;
+  padding: var(--spacing-md-lg) var(--spacing-lg);
+  font-size: var(--font-size-md);
+  font-weight: var(--font-weight-semibold);
+  color: var(--color-text-tertiary);
   text-transform: uppercase;
   letter-spacing: 0.5px;
 }
 
 .logs-table tbody tr {
-  border-bottom: 1px solid rgba(255, 255, 255, 0.05);
+  border-bottom: 1px solid rgba(var(--color-white-rgb), 0.05);
   transition: background 0.2s ease;
 }
 
 .logs-table tbody tr:hover {
-  background: rgba(22, 93, 255, 0.05);
+  background: rgba(var(--color-primary-rgb), 0.05);
 }
 
 .logs-table td {
-  padding: 14px 16px;
-  font-size: 14px;
-  color: #E2E8F0;
+  padding: var(--spacing-md-lg) var(--spacing-lg);
+  font-size: var(--font-size-base);
+  color: var(--color-text-secondary);
 }
 
 .log-id {
   font-family: monospace;
-  color: #69B1FF;
+  color: var(--color-info-light);
 }
 
 .log-user {
-  font-weight: 500;
+  font-weight: var(--font-weight-medium);
 }
 
 .action-badge {
-  padding: 4px 10px;
-  background: rgba(22, 93, 255, 0.2);
-  color: #69B1FF;
-  border-radius: 8px;
-  font-size: 12px;
+  padding: var(--spacing-2xs) var(--spacing-sm-md);
+  background: rgba(var(--color-primary-rgb), 0.2);
+  color: var(--color-info-light);
+  border-radius: var(--radius-lg);
+  font-size: var(--font-size-sm);
 }
 
 .log-device {
@@ -312,60 +312,60 @@ const statusOptions = [
 .commands-list {
   display: flex;
   flex-direction: column;
-  gap: 4px;
+  gap: var(--spacing-2xs);
 }
 
 .command-item {
-  font-size: 12px;
-  color: #52C41A;
+  font-size: var(--font-size-sm);
+  color: var(--color-success);
   font-family: monospace;
-  padding: 4px 8px;
-  background: rgba(82, 196, 26, 0.1);
-  border-radius: 4px;
+  padding: var(--spacing-2xs) var(--spacing-sm);
+  background: rgba(var(--color-success-rgb), 0.1);
+  border-radius: var(--radius-sm);
 }
 
 .no-commands {
-  color: #64748B;
-  font-size: 12px;
+  color: var(--color-text-quaternary);
+  font-size: var(--font-size-sm);
 }
 
 .approval-link {
-  font-size: 12px;
-  color: #FF7D00;
+  font-size: var(--font-size-sm);
+  color: var(--color-orange);
   text-decoration: underline;
   cursor: pointer;
 }
 
 .no-approval {
-  color: #64748B;
-  font-size: 12px;
+  color: var(--color-text-quaternary);
+  font-size: var(--font-size-sm);
 }
 
 .status-badge {
-  padding: 4px 12px;
-  border-radius: 8px;
-  font-size: 12px;
-  font-weight: 500;
+  padding: var(--spacing-2xs) var(--spacing-md);
+  border-radius: var(--radius-lg);
+  font-size: var(--font-size-sm);
+  font-weight: var(--font-weight-medium);
 }
 
 .status-badge.success {
-  background: rgba(82, 196, 26, 0.2);
-  color: #52C41A;
+  background: rgba(var(--color-success-rgb), 0.2);
+  color: var(--color-success);
 }
 
 .status-badge.pending {
-  background: rgba(255, 125, 0, 0.2);
-  color: #FF7D00;
+  background: rgba(var(--color-orange-rgb), 0.2);
+  color: var(--color-orange);
 }
 
 .status-badge.failed {
-  background: rgba(255, 77, 79, 0.2);
-  color: #FF4D4F;
+  background: rgba(var(--color-error-rgb), 0.2);
+  color: var(--color-error);
 }
 
 .log-time {
-  font-size: 13px;
-  color: #64748B;
+  font-size: var(--font-size-md);
+  color: var(--color-text-quaternary);
 }
 
 .empty-state {
@@ -373,16 +373,16 @@ const statusOptions = [
   flex-direction: column;
   align-items: center;
   justify-content: center;
-  padding: 60px 20px;
-  color: #64748B;
+  padding: var(--spacing-6xl) var(--spacing-xl);
+  color: var(--color-text-quaternary);
 }
 
 .empty-icon {
-  font-size: 48px;
-  margin-bottom: 16px;
+  font-size: var(--font-size-6xl);
+  margin-bottom: var(--spacing-lg);
 }
 
 .empty-state p {
-  font-size: 14px;
+  font-size: var(--font-size-base);
 }
 </style>

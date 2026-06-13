@@ -2,7 +2,7 @@ from langchain.chat_models import ChatOpenAI
 from langchain.output_parsers import PydanticOutputParser
 from pydantic import BaseModel, Field
 from typing import List, Optional
-from backend.core.config import settings
+from ..core.config import settings
 
 class ActionItem(BaseModel):
     type: str = Field(description="操作类型，如qos、acl、route等")

@@ -51,7 +51,103 @@ services:
       timeout: 10s
       retries: 3
 
+  orchestrator:
+    build: ./backend
+    container_name: netops-orchestrator
+    command: uvicorn backend.api.main:app --host 0.0.0.0 --port 8000
+    depends_on:
+      postgresql:
+        condition: service_healthy
+      redis:
+        condition: service_healthy
+    environment:
+      DATABASE_URL: postgresql+asyncpg://netops_user:netops_password@postgresql:5432/netops_db
+      REDIS_URL: redis://redis:6379/0
+      SECRET_KEY: ${SECRET_KEY:-change-me-in-production}
+      DEEPSEEK_API_KEY: ${DEEPSEEK_API_KEY:-}
+      ZHIPU_API_KEY: ${ZHIPU_API_KEY:-}
+    ports:
+      - "8000:8000"
+    healthcheck:
+      test: ["CMD-SHELL", "curl -f http://localhost:8000/api/v1/health || exit 1"]
+      interval: 30s
+      timeout: 10s
+      retries: 3
+
+  agent-worker:
+    build: ./backend
+    container_name: netops-agent-worker
+    command: python -m backend.agents.worker
+    depends_on:
+      orchestrator:
+        condition: service_healthy
+      redis:
+        condition: service_healthy
+    environment:
+      DATABASE_URL: postgresql+asyncpg://netops_user:netops_password@postgresql:5432/netops_db
+      REDIS_URL: redis://redis:6379/0
+      SECRET_KEY: ${SECRET_KEY:-change-me-in-production}
+      DEEPSEEK_API_KEY: ${DEEPSEEK_API_KEY:-}
+      ZHIPU_API_KEY: ${ZHIPU_API_KEY:-}
+      WORKER_ID: worker-1
+    deploy:
+      replicas: 2
+
+  mcp-registry:
+    build: ./backend
+    container_name: netops-mcp-registry
+    command: python -m backend.agents.mcp_registry_server
+    depends_on:
+      redis:
+        condition: service_healthy
+    environment:
+      REDIS_URL: redis://redis:6379/0
+    ports:
+      - "8001:8001"
+
+  a2a-gateway:
+    build: ./backend
+    container_name: netops-a2a-gateway
+    command: python -m backend.agents.a2a_gateway_server
+    depends_on:
+      redis:
+        condition: service_healthy
+    environment:
+      REDIS_URL: redis://redis:6379/0
+    ports:
+      - "8002:8002"
+
+  frontend:
+    build: ./frontend
+    container_name: netops-frontend
+    depends_on:
+      orchestrator:
+        condition: service_healthy
+    ports:
+      - "80:80"
+
+  jaeger:
+    image: jaegertracing/all-in-one:latest
+    container_name: netops-jaeger
+    environment:
+      COLLECTOR_OTLP_ENABLED: true
+    ports:
+      - "16686:16686"
+      - "4317:4317"
+      - "4318:4318"
+
+  chromadb:
+    image: chromadb/chroma:latest
+    container_name: netops-chromadb
+    ports:
+      - "8003:8000"
+    volumes:
+      - chromadb_data:/chroma/chroma
+    environment:
+      ANONYMIZED_TELEMETRY: FALSE
+
 volumes:
   postgres_data:
   influxdb_data:
   redis_data:
+  chromadb_data:

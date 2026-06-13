@@ -1,0 +1,324 @@
+/* ============================================================
+ * 智维 AgentHub — Design Token System
+ * 基于 OKLCH 色彩空间 · CSS 自定义属性
+ *
+ * 规范文档：前端页面设计规范.md
+ * 审计基线：前端页面设计规范检查.md
+ * ============================================================ */
+
+:root {
+  /* ----------------------------------------------------------
+   * 1. 色彩系统（OKLCH 色彩空间）
+   *    格式：oklch(L C H)
+   *    L = 亮度 0-1, C = 色度 0-0.4, H = 色相 0-360
+   *    RGB 分解变量用于 rgba(var(--xxx-rgb), alpha) 格式
+   * ---------------------------------------------------------- */
+
+  /* 1.1 品牌主色 */
+  --color-primary:            oklch(0.55 0.22 264);       /* #165DFF */
+  --color-primary-rgb:        22, 93, 255;
+  --color-primary-light:      oklch(0.68 0.18 264);       /* #5E9DFF */
+  --color-primary-light-rgb:  94, 157, 255;
+  --color-primary-dark:       oklch(0.42 0.20 264);       /* #0A3DB8 */
+  --color-primary-dark-rgb:   10, 61, 184;
+
+  /* 1.2 宇宙蓝（数据可视化强调色） */
+  --color-cosmic:             oklch(0.58 0.22 255);       /* #0A84FF */
+  --color-cosmic-rgb:         10, 132, 255;
+
+  /* 1.3 语义色 — 成功 */
+  --color-success:            oklch(0.65 0.18 145);       /* #22C55E */
+  --color-success-rgb:        34, 197, 94;
+  --color-success-light:      oklch(0.80 0.12 145);
+  --color-success-light-rgb:  134, 239, 172;
+
+  /* 1.4 语义色 — 警告 */
+  --color-warning:            oklch(0.75 0.16 75);        /* #F59E0B */
+  --color-warning-rgb:        245, 158, 11;
+  --color-warning-light:      oklch(0.88 0.10 75);
+  --color-warning-light-rgb:  253, 224, 71;
+
+  /* 1.5 语义色 — 错误/危险 */
+  --color-error:              oklch(0.60 0.22 25);        /* #EF4444 */
+  --color-error-rgb:          239, 68, 68;
+  --color-error-light:        oklch(0.78 0.14 25);
+  --color-error-light-rgb:    248, 113, 113;
+
+  /* 1.6 语义色 — 信息 */
+  --color-info:               oklch(0.62 0.16 240);       /* #3B82F6 */
+  --color-info-rgb:           59, 130, 246;
+  --color-info-light:         oklch(0.75 0.10 240);       /* #69B1FF */
+  --color-info-light-rgb:     105, 177, 255;
+
+  /* 1.6b 扩展语义色 — 紫色 */
+  --color-purple:             oklch(0.62 0.18 300);       /* #B37FEB */
+  --color-purple-rgb:         179, 127, 235;
+  --color-purple-light:       oklch(0.78 0.10 300);       /* #D3ADF7 */
+
+  /* 1.6c 扩展语义色 — 橙色 */
+  --color-orange:             oklch(0.68 0.17 55);        /* #FF7A45 */
+  --color-orange-rgb:         255, 122, 69;
+  --color-orange-light:       oklch(0.80 0.12 55);        /* #FF7D00 */
+
+  /* 1.6d 扩展语义色 — 青色 */
+  --color-cyan:               oklch(0.68 0.12 200);       /* #36CFC9 */
+  --color-cyan-rgb:           54, 207, 201;
+
+  /* 1.6e 扩展语义色 — 粉色 */
+  --color-pink:               oklch(0.65 0.18 350);       /* #F759AB */
+  --color-pink-rgb:           247, 89, 171;
+
+  /* 1.6f 扩展语义色 — 金色 */
+  --color-gold:               oklch(0.72 0.14 85);        /* #D4B106 */
+  --color-gold-rgb:           212, 177, 6;
+
+  /* 1.7 中性色 — 文字 */
+  --color-text-primary:       oklch(0.95 0.01 264);       /* 主文字 #F1F5F9 */
+  --color-text-primary-rgb:   241, 245, 249;
+  --color-text-secondary:     oklch(0.78 0.02 264);       /* 次要文字 #CBD5E1 */
+  --color-text-secondary-rgb: 203, 213, 225;
+  --color-text-tertiary:      oklch(0.62 0.02 264);       /* 辅助文字 #94A3B8 */
+  --color-text-tertiary-rgb:  148, 163, 184;
+  --color-text-quaternary:    oklch(0.50 0.02 264);       /* 最弱文字 #64748B */
+  --color-text-quaternary-rgb: 100, 116, 139;
+  --color-text-disabled:      oklch(0.45 0.01 264);       /* 禁用态文字 */
+
+  /* 1.8 中性色 — 背景 */
+  --color-bg-base:            oklch(0.15 0.02 264);       /* 页面底色 #0F172A */
+  --color-bg-base-rgb:        15, 23, 42;
+  --color-bg-deep:            oklch(0.12 0.02 264);       /* 深层背景 */
+  --color-bg-deep-rgb:        15, 23, 42;
+  --color-bg-elevated:        oklch(0.20 0.02 264);       /* 卡片/面板 */
+  --color-bg-elevated-rgb:    30, 41, 59;
+  --color-bg-container:       oklch(0.17 0.02 264);       /* 容器背景 #1E293B */
+  --color-bg-container-rgb:   30, 41, 59;
+  --color-bg-overlay:         oklch(0.18 0.02 264);       /* 浮层/弹窗 */
+  --color-bg-overlay-rgb:     15, 23, 42;
+  --color-bg-hover:           oklch(0.25 0.02 264);       /* 悬停态背景 */
+  --color-bg-hover-rgb:       51, 65, 85;
+  --color-bg-active:          oklch(0.28 0.02 264);       /* 激活态背景 */
+  --color-bg-active-rgb:      51, 65, 85;
+  --color-bg-surface:         oklch(0.22 0.02 264);       /* 表面色 #334155 */
+  --color-bg-surface-rgb:     51, 65, 85;
+
+  /* 1.9 中性色 — 边框 */
+  --color-border:             oklch(0.30 0.02 264);       /* 默认边框 */
+  --color-border-rgb:         51, 65, 85;
+  --color-border-light:       oklch(0.24 0.01 264);       /* 浅色边框 */
+  --color-border-light-rgb:   30, 41, 59;
+  --color-border-focus:       oklch(0.55 0.18 264);       /* 焦点边框（主色） */
+
+  /* 1.10 基础色 */
+  --color-white:              oklch(1 0 0);               /* #FFFFFF */
+  --color-white-rgb:          255, 255, 255;
+  --color-black:              oklch(0 0 0);               /* #000000 */
+  --color-black-rgb:          0, 0, 0;
+  --color-transparent:        transparent;
+
+  /* 1.11 渐变 */
+  --gradient-primary:         linear-gradient(135deg, oklch(0.55 0.22 264), oklch(0.58 0.22 255));
+  --gradient-cosmic:          linear-gradient(135deg, oklch(0.58 0.22 255), oklch(0.65 0.18 290));
+  --gradient-dark:            linear-gradient(180deg, oklch(0.15 0.02 264), oklch(0.12 0.02 264));
+
+  /* ----------------------------------------------------------
+   * 2. 间距系统
+   *    命名规则：--spacing-{级别}
+   *    基准单位：2px，递增步长：2px
+   * ---------------------------------------------------------- */
+  --spacing-3xs:   2px;
+  --spacing-2xs:   4px;
+  --spacing-xs:    6px;
+  --spacing-sm:    8px;
+  --spacing-sm-md: 10px;
+  --spacing-md:    12px;
+  --spacing-md-lg: 14px;
+  --spacing-lg:    16px;
+  --spacing-xl:    20px;
+  --spacing-2xl:   24px;
+  --spacing-3xl:   32px;
+  --spacing-4xl:   40px;
+  --spacing-5xl:   48px;
+  --spacing-6xl:   64px;
+
+  /* ----------------------------------------------------------
+   * 3. 圆角系统
+   *    命名规则：--radius-{级别}
+   * ---------------------------------------------------------- */
+  --radius-none:  0px;
+  --radius-2xs:   2px;
+  --radius-xs:    3px;
+  --radius-sm:    4px;
+  --radius-md:    6px;
+  --radius-lg:    8px;
+  --radius-xl:    12px;
+  --radius-2xl:   16px;
+  --radius-full:  9999px;
+
+  /* ----------------------------------------------------------
+   * 4. 阴影系统
+   *    命名规则：--shadow-{级别}
+   *    暗色主题阴影使用 rgba(var(--color-black-rgb), alpha)
+   * ---------------------------------------------------------- */
+  --shadow-xs:    0 1px 2px rgba(var(--color-black-rgb), 0.15);
+  --shadow-sm:    0 2px 4px rgba(var(--color-black-rgb), 0.20);
+  --shadow-md:    0 4px 8px rgba(var(--color-black-rgb), 0.25);
+  --shadow-lg:    0 8px 16px rgba(var(--color-black-rgb), 0.30);
+  --shadow-xl:    0 12px 24px rgba(var(--color-black-rgb), 0.35);
+  --shadow-glow:  0 0 12px rgba(var(--color-primary-rgb), 0.25);
+  --shadow-glow-strong: 0 0 20px rgba(var(--color-primary-rgb), 0.40);
+
+  /* ----------------------------------------------------------
+   * 5. 排版系统
+   * ---------------------------------------------------------- */
+
+  /* 5.1 字体族 */
+  --font-family-base:  "Inter", "PingFang SC", "Microsoft YaHei", system-ui, -apple-system, sans-serif;
+  --font-family-mono:  "JetBrains Mono", "Fira Code", "Cascadia Code", ui-monospace, monospace;
+  --font-family-display: "Inter", "PingFang SC", system-ui, sans-serif;
+
+  /* 5.2 字号 */
+  --font-size-2xs:   10px;
+  --font-size-xs:    11px;
+  --font-size-sm:    12px;
+  --font-size-base:  14px;
+  --font-size-md:    15px;
+  --font-size-lg:    16px;
+  --font-size-xl:    18px;
+  --font-size-2xl:   20px;
+  --font-size-3xl:   24px;
+  --font-size-4xl:   32px;
+  --font-size-5xl:   36px;
+  --font-size-6xl:   48px;
+
+  /* 5.3 字重 */
+  --font-weight-regular:   400;
+  --font-weight-medium:    500;
+  --font-weight-semibold:  600;
+  --font-weight-bold:      700;
+  --font-weight-extrabold: 800;
+
+  /* 5.4 行高 */
+  --line-height-tight:    1.2;
+  --line-height-snug:     1.35;
+  --line-height-normal:   1.5;
+  --line-height-relaxed:  1.65;
+  --line-height-loose:    1.8;
+
+  /* 5.5 字间距 */
+  --letter-spacing-tight:  -0.02em;
+  --letter-spacing-normal: 0;
+  --letter-spacing-wide:   0.02em;
+  --letter-spacing-wider:  0.05em;
+
+  /* ----------------------------------------------------------
+   * 6. 布局尺寸
+   * ---------------------------------------------------------- */
+
+  /* 6.1 侧边栏 */
+  --sidebar-width:          240px;
+  --sidebar-collapsed:      64px;
+  --sidebar-transition:     0.3s cubic-bezier(0.4, 0, 0.2, 1);
+
+  /* 6.2 顶栏 */
+  --header-height:          56px;
+
+  /* 6.3 内容区 */
+  --content-max-width:      1440px;
+  --content-padding:        var(--spacing-2xl);
+
+  /* 6.4 卡片 */
+  --card-padding:           var(--spacing-lg);
+  --card-gap:               var(--spacing-lg);
+  --card-min-height:        120px;
+
+  /* ----------------------------------------------------------
+   * 7. 过渡与动画
+   * ---------------------------------------------------------- */
+  --duration-instant:  100ms;
+  --duration-fast:     150ms;
+  --duration-normal:   250ms;
+  --duration-slow:     350ms;
+  --duration-slower:   500ms;
+
+  --ease-default:      cubic-bezier(0.4, 0, 0.2, 1);
+  --ease-in:           cubic-bezier(0.4, 0, 1, 1);
+  --ease-out:          cubic-bezier(0, 0, 0.2, 1);
+  --ease-in-out:       cubic-bezier(0.4, 0, 0.2, 1);
+  --ease-bounce:       cubic-bezier(0.34, 1.56, 0.64, 1);
+
+  /* ----------------------------------------------------------
+   * 8. 层级（z-index）
+   * ---------------------------------------------------------- */
+  --z-base:       0;
+  --z-dropdown:   100;
+  --z-sticky:     200;
+  --z-overlay:    300;
+  --z-modal:      400;
+  --z-popover:    500;
+  --z-tooltip:    600;
+  --z-notification: 700;
+  --z-toast:      800;
+
+  /* ----------------------------------------------------------
+   * 9. 断点（供 JS 读取，CSS 使用 @media）
+   * ---------------------------------------------------------- */
+  --bp-sm:  640px;
+  --bp-md:  768px;
+  --bp-lg:  1024px;
+  --bp-xl:  1280px;
+  --bp-2xl: 1536px;
+}
+
+/* ============================================================
+ * 全局焦点样式（无障碍合规）
+ * ============================================================ */
+
+:focus-visible {
+  outline: 2px solid var(--color-primary);
+  outline-offset: 2px;
+  border-radius: var(--radius-sm);
+}
+
+:focus:not(:focus-visible):not(:active) {
+  outline: none;
+}
+
+:active {
+  outline: none;
+}
+
+/* ============================================================
+ * 高对比度适配
+ * ============================================================ */
+
+@media (prefers-contrast: more) {
+  :root {
+    --color-text-primary:   oklch(1 0 0);
+    --color-text-secondary: oklch(0.90 0.01 264);
+    --color-text-tertiary:  oklch(0.78 0.02 264);
+    --color-border:         oklch(0.50 0.02 264);
+    --color-border-light:   oklch(0.40 0.02 264);
+    --shadow-sm:            0 2px 4px rgba(var(--color-black-rgb), 0.40);
+    --shadow-md:            0 4px 8px rgba(var(--color-black-rgb), 0.50);
+  }
+
+  :focus-visible {
+    outline-width: 3px;
+    outline-offset: 3px;
+  }
+}
+
+/* ============================================================
+ * 减少动画适配
+ * ============================================================ */
+
+@media (prefers-reduced-motion: reduce) {
+  *,
+  *::before,
+  *::after {
+    animation-duration: 0.01ms !important;
+    animation-iteration-count: 1 !important;
+    transition-duration: 0.01ms !important;
+    scroll-behavior: auto !important;
+  }
+}

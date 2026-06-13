@@ -1,9 +1,9 @@
 from langgraph.graph import StateGraph, END
 from typing import TypedDict, Optional, List
-from backend.agents.intent_parser import IntentParserAgent
-from backend.agents.config_generator import ConfigGeneratorAgent
-from backend.agents.config_executor import ConfigExecutorAgent
-from backend.agents.validator import ValidatorAgent
+from .intent_parser import IntentParserAgent
+from .config_generator import ConfigGeneratorAgent
+from .config_executor import ConfigExecutorAgent
+from .validator import ValidatorAgent
 
 class IntentState(TypedDict):
     user_input: str

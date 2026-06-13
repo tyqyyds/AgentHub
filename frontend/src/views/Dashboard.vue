@@ -2,10 +2,10 @@
 import { ref, onMounted } from 'vue'
 
 const stats = ref([
-  { label: '活跃意图', value: 24, unit: '个', color: '#165DFF' },
-  { label: '在线设备', value: 156, unit: '台', color: '#52C41A' },
-  { label: '自愈事件', value: 8, unit: '次', color: '#FF7D00' },
-  { label: '待审批', value: 3, unit: '项', color: '#FF4D4F' }
+  { label: '活跃意图', value: 24, unit: '个', colorType: 'primary' },
+  { label: '在线设备', value: 156, unit: '台', colorType: 'success' },
+  { label: '自愈事件', value: 8, unit: '次', colorType: 'orange' },
+  { label: '待审批', value: 3, unit: '项', colorType: 'error' }
 ])
 
 const recentIntents = ref([
@@ -40,7 +40,7 @@ onMounted(() => {
         :key="stat.label"
         class="stat-card"
       >
-        <div class="stat-icon" :style="{ background: `${stat.color}20`, color: stat.color }">
+        <div class="stat-icon" :class="`stat-${stat.colorType}`">
           {{ stat.label === '活跃意图' ? '🎯' : stat.label === '在线设备' ? '🖥️' : stat.label === '自愈事件' ? '🛡️' : '📋' }}
         </div>
         <div class="stat-content">
@@ -89,7 +89,8 @@ onMounted(() => {
             <div class="health-bar-container">
               <div
                 class="health-bar"
-                :style="{ width: `${device.health}%`, background: device.status === 'warning' ? '#FAAD14' : '#52C41A' }"
+                :class="device.status === 'warning' ? 'health-bar-warning' : 'health-bar-normal'"
+                :style="{ width: `${device.health}%` }"
               ></div>
             </div>
             <div :class="['health-value', device.status]">{{ device.health }}%</div>
@@ -102,37 +103,37 @@ onMounted(() => {
 
 <style scoped>
 .page-title {
-  font-size: 24px;
-  font-weight: 700;
-  color: white;
-  margin-bottom: 24px;
+  font-size: var(--font-size-3xl);
+  font-weight: var(--font-weight-bold);
+  color: var(--color-white);
+  margin-bottom: var(--spacing-2xl);
 }
 
 .stats-grid {
   display: grid;
   grid-template-columns: repeat(4, 1fr);
-  gap: 20px;
-  margin-bottom: 24px;
+  gap: var(--spacing-xl);
+  margin-bottom: var(--spacing-2xl);
 }
 
 .stat-card {
-  background: rgba(30, 41, 59, 0.6);
-  border-radius: 16px;
-  padding: 20px;
+  background: rgba(var(--color-bg-container-rgb), 0.6);
+  border-radius: var(--radius-2xl);
+  padding: var(--spacing-xl);
   display: flex;
   align-items: center;
-  gap: 16px;
-  border: 1px solid rgba(255, 255, 255, 0.1);
+  gap: var(--spacing-lg);
+  border: 1px solid rgba(var(--color-white-rgb), 0.1);
 }
 
 .stat-icon {
   width: 48px;
   height: 48px;
-  border-radius: 12px;
+  border-radius: var(--radius-xl);
   display: flex;
   align-items: center;
   justify-content: center;
-  font-size: 24px;
+  font-size: var(--font-size-3xl);
 }
 
 .stat-content {
@@ -140,58 +141,58 @@ onMounted(() => {
 }
 
 .stat-value {
-  font-size: 32px;
-  font-weight: 700;
-  color: white;
-  line-height: 1.2;
+  font-size: var(--font-size-4xl);
+  font-weight: var(--font-weight-bold);
+  color: var(--color-white);
+  line-height: var(--line-height-tight);
 }
 
 .stat-unit {
-  font-size: 14px;
-  font-weight: 400;
-  color: #94A3B8;
-  margin-left: 4px;
+  font-size: var(--font-size-base);
+  font-weight: var(--font-weight-regular);
+  color: var(--color-text-tertiary);
+  margin-left: var(--spacing-2xs);
 }
 
 .stat-label {
-  font-size: 14px;
-  color: #94A3B8;
-  margin-top: 4px;
+  font-size: var(--font-size-base);
+  color: var(--color-text-tertiary);
+  margin-top: var(--spacing-2xs);
 }
 
 .content-row {
   display: grid;
   grid-template-columns: 2fr 1fr;
-  gap: 20px;
+  gap: var(--spacing-xl);
 }
 
 .panel {
-  background: rgba(30, 41, 59, 0.6);
-  border-radius: 16px;
-  padding: 20px;
-  border: 1px solid rgba(255, 255, 255, 0.1);
+  background: rgba(var(--color-bg-container-rgb), 0.6);
+  border-radius: var(--radius-2xl);
+  padding: var(--spacing-xl);
+  border: 1px solid rgba(var(--color-white-rgb), 0.1);
 }
 
 .panel-title {
-  font-size: 16px;
-  font-weight: 600;
-  color: white;
-  margin-bottom: 16px;
+  font-size: var(--font-size-lg);
+  font-weight: var(--font-weight-semibold);
+  color: var(--color-white);
+  margin-bottom: var(--spacing-lg);
 }
 
 .intent-list {
   display: flex;
   flex-direction: column;
-  gap: 12px;
+  gap: var(--spacing-md);
 }
 
 .intent-item {
   display: flex;
   align-items: center;
-  gap: 16px;
-  padding: 14px;
-  background: rgba(15, 23, 42, 0.5);
-  border-radius: 10px;
+  gap: var(--spacing-lg);
+  padding: var(--spacing-md-lg);
+  background: rgba(var(--color-bg-base-rgb), 0.5);
+  border-radius: var(--radius-lg);
 }
 
 .intent-info {
@@ -199,100 +200,130 @@ onMounted(() => {
 }
 
 .intent-id {
-  font-size: 12px;
-  color: #64748B;
-  margin-bottom: 4px;
+  font-size: var(--font-size-sm);
+  color: var(--color-text-quaternary);
+  margin-bottom: var(--spacing-2xs);
 }
 
 .intent-name {
-  font-size: 14px;
-  font-weight: 500;
-  color: white;
+  font-size: var(--font-size-base);
+  font-weight: var(--font-weight-medium);
+  color: var(--color-white);
 }
 
 .intent-meta {
   display: flex;
   flex-direction: column;
   align-items: flex-end;
-  gap: 4px;
+  gap: var(--spacing-2xs);
 }
 
 .intent-device {
-  font-size: 12px;
-  color: #64748B;
+  font-size: var(--font-size-sm);
+  color: var(--color-text-quaternary);
 }
 
 .intent-status {
-  font-size: 12px;
-  padding: 2px 8px;
-  border-radius: 12px;
-  font-weight: 500;
+  font-size: var(--font-size-sm);
+  padding: var(--spacing-3xs) var(--spacing-sm);
+  border-radius: var(--radius-xl);
+  font-weight: var(--font-weight-medium);
 }
 
 .intent-status.running {
-  background: rgba(22, 93, 255, 0.2);
-  color: #69B1FF;
+  background: rgba(var(--color-primary-rgb), 0.2);
+  color: var(--color-info-light);
 }
 
 .intent-status.completed {
-  background: rgba(82, 196, 26, 0.2);
-  color: #52C41A;
+  background: rgba(var(--color-success-rgb), 0.2);
+  color: var(--color-success);
 }
 
 .intent-status.pending {
-  background: rgba(255, 125, 0, 0.2);
-  color: #FF7D00;
+  background: rgba(var(--color-orange-rgb), 0.2);
+  color: var(--color-orange-light);
 }
 
 .intent-time {
-  font-size: 12px;
-  color: #64748B;
+  font-size: var(--font-size-sm);
+  color: var(--color-text-quaternary);
 }
 
 .health-list {
   display: flex;
   flex-direction: column;
-  gap: 16px;
+  gap: var(--spacing-lg);
 }
 
 .health-item {
   display: flex;
   align-items: center;
-  gap: 12px;
+  gap: var(--spacing-md);
 }
 
 .health-name {
   width: 100px;
-  font-size: 13px;
-  color: #E2E8F0;
+  font-size: var(--font-size-sm);
+  color: var(--color-text-secondary);
 }
 
 .health-bar-container {
   flex: 1;
-  height: 8px;
-  background: rgba(255, 255, 255, 0.1);
-  border-radius: 4px;
+  height: var(--spacing-sm);
+  background: rgba(var(--color-white-rgb), 0.1);
+  border-radius: var(--radius-sm);
   overflow: hidden;
 }
 
 .health-bar {
   height: 100%;
-  border-radius: 4px;
+  border-radius: var(--radius-sm);
   transition: width 0.3s ease;
 }
 
 .health-value {
   width: 50px;
   text-align: right;
-  font-size: 13px;
-  font-weight: 500;
+  font-size: var(--font-size-sm);
+  font-weight: var(--font-weight-medium);
 }
 
 .health-value.normal {
-  color: #52C41A;
+  color: var(--color-success);
 }
 
 .health-value.warning {
-  color: #FAAD14;
+  color: var(--color-warning);
+}
+
+/* 动态颜色类 — stat-icon */
+.stat-primary {
+  background: rgba(var(--color-primary-rgb), 0.2);
+  color: var(--color-primary);
+}
+
+.stat-success {
+  background: rgba(var(--color-success-rgb), 0.2);
+  color: var(--color-success);
+}
+
+.stat-orange {
+  background: rgba(var(--color-orange-rgb), 0.2);
+  color: var(--color-orange);
+}
+
+.stat-error {
+  background: rgba(var(--color-error-rgb), 0.2);
+  color: var(--color-error);
+}
+
+/* 动态颜色类 — health-bar */
+.health-bar-warning {
+  background: var(--color-warning);
+}
+
+.health-bar-normal {
+  background: var(--color-success);
 }
 </style>

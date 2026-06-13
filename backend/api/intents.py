@@ -1,8 +1,8 @@
 from fastapi import APIRouter, Depends, HTTPException
 from sqlalchemy.ext.asyncio import AsyncSession
 from pydantic import BaseModel
-from backend.database.connection import get_db_session
-from backend.database.models import Intent, ApprovalStatus
+from ..database.connection import get_db_session
+from ..database.models import Intent, ApprovalStatus
 
 router = APIRouter()
 

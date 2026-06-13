@@ -28,7 +28,7 @@ const intentHistory = ref([
   }
 ])
 
-const thinkingSteps = ref([])
+const thinkingSteps = ref<string[]>([])
 
 const submitIntent = async () => {
   if (!intentInput.value.trim()) return
@@ -130,48 +130,48 @@ const submitIntent = async () => {
 
 <style scoped>
 .page-title {
-  font-size: 24px;
-  font-weight: 700;
-  color: white;
-  margin-bottom: 24px;
+  font-size: var(--font-size-3xl);
+  font-weight: var(--font-weight-bold);
+  color: var(--color-white);
+  margin-bottom: var(--spacing-2xl);
 }
 
 .workspace-layout {
   display: grid;
   grid-template-columns: 1fr 1fr;
-  gap: 24px;
+  gap: var(--spacing-2xl);
 }
 
 .intent-input-panel,
 .intent-history-panel {
-  background: rgba(30, 41, 59, 0.6);
-  border-radius: 16px;
-  padding: 24px;
-  border: 1px solid rgba(255, 255, 255, 0.1);
+  background: rgba(var(--color-bg-container-rgb), 0.6);
+  border-radius: var(--radius-2xl);
+  padding: var(--spacing-2xl);
+  border: 1px solid rgba(var(--color-white-rgb), 0.1);
 }
 
 .panel-title {
-  font-size: 16px;
-  font-weight: 600;
-  color: white;
-  margin-bottom: 20px;
+  font-size: var(--font-size-lg);
+  font-weight: var(--font-weight-semibold);
+  color: var(--color-white);
+  margin-bottom: var(--spacing-xl);
 }
 
 .input-container {
   display: flex;
   flex-direction: column;
-  gap: 16px;
+  gap: var(--spacing-lg);
 }
 
 .intent-textarea {
   width: 100%;
   min-height: 150px;
-  padding: 16px;
-  border: 2px solid rgba(255, 255, 255, 0.1);
-  border-radius: 12px;
-  background: rgba(15, 23, 42, 0.5);
-  color: white;
-  font-size: 14px;
+  padding: var(--spacing-lg);
+  border: 2px solid rgba(var(--color-white-rgb), 0.1);
+  border-radius: var(--radius-lg);
+  background: rgba(var(--color-bg-base-rgb), 0.5);
+  color: var(--color-white);
+  font-size: var(--font-size-base);
   font-family: inherit;
   resize: vertical;
   transition: all 0.3s ease;
@@ -179,29 +179,29 @@ const submitIntent = async () => {
 
 .intent-textarea:focus {
   outline: none;
-  border-color: #165DFF;
-  box-shadow: 0 0 0 4px rgba(22, 93, 255, 0.1);
+  border-color: var(--color-primary);
+  box-shadow: 0 0 0 var(--spacing-2xs) rgba(var(--color-primary-rgb), 0.1);
 }
 
 .intent-textarea::placeholder {
-  color: #64748B;
+  color: var(--color-text-quaternary);
 }
 
 .submit-btn {
-  padding: 14px 24px;
-  background: linear-gradient(135deg, #165DFF 0%, #4080FF 100%);
-  color: white;
+  padding: 14px var(--spacing-2xl);
+  background: var(--gradient-primary);
+  color: var(--color-white);
   border: none;
   border-radius: 10px;
-  font-size: 14px;
-  font-weight: 600;
+  font-size: var(--font-size-base);
+  font-weight: var(--font-weight-semibold);
   cursor: pointer;
   transition: all 0.3s ease;
 }
 
 .submit-btn:hover:not(:disabled) {
   transform: translateY(-2px);
-  box-shadow: 0 6px 20px rgba(22, 93, 255, 0.4);
+  box-shadow: 0 var(--spacing-xs) var(--spacing-xl) rgba(var(--color-primary-rgb), 0.4);
 }
 
 .submit-btn:disabled {
@@ -210,38 +210,38 @@ const submitIntent = async () => {
 }
 
 .thinking-panel {
-  margin-top: 20px;
-  padding: 16px;
-  background: rgba(15, 23, 42, 0.5);
-  border-radius: 12px;
+  margin-top: var(--spacing-xl);
+  padding: var(--spacing-lg);
+  background: rgba(var(--color-bg-base-rgb), 0.5);
+  border-radius: var(--radius-lg);
 }
 
 .thinking-title {
-  font-size: 14px;
-  font-weight: 600;
-  color: #69B1FF;
-  margin-bottom: 12px;
+  font-size: var(--font-size-base);
+  font-weight: var(--font-weight-semibold);
+  color: var(--color-info-light);
+  margin-bottom: var(--spacing-md);
 }
 
 .thinking-steps {
   display: flex;
   flex-direction: column;
-  gap: 8px;
+  gap: var(--spacing-sm);
 }
 
 .thinking-step {
   display: flex;
   align-items: center;
-  gap: 8px;
-  font-size: 13px;
-  color: #E2E8F0;
+  gap: var(--spacing-sm);
+  font-size: var(--font-size-sm);
+  color: var(--color-text-secondary);
 }
 
 .step-dot {
-  width: 8px;
-  height: 8px;
-  background: #165DFF;
-  border-radius: 50%;
+  width: var(--spacing-sm);
+  height: var(--spacing-sm);
+  background: var(--color-primary);
+  border-radius: var(--radius-full);
   animation: pulse 1s ease-in-out infinite;
 }
 
@@ -253,68 +253,68 @@ const submitIntent = async () => {
 .history-list {
   display: flex;
   flex-direction: column;
-  gap: 16px;
+  gap: var(--spacing-lg);
 }
 
 .history-item {
-  padding: 16px;
-  background: rgba(15, 23, 42, 0.5);
-  border-radius: 12px;
+  padding: var(--spacing-lg);
+  background: rgba(var(--color-bg-base-rgb), 0.5);
+  border-radius: var(--radius-lg);
 }
 
 .history-header {
   display: flex;
   justify-content: space-between;
   align-items: center;
-  margin-bottom: 12px;
+  margin-bottom: var(--spacing-md);
 }
 
 .status-badge {
-  font-size: 12px;
-  padding: 4px 12px;
-  border-radius: 12px;
-  font-weight: 500;
+  font-size: var(--font-size-xs);
+  padding: var(--spacing-2xs) var(--spacing-md);
+  border-radius: var(--radius-lg);
+  font-weight: var(--font-weight-medium);
 }
 
 .status-badge.completed {
-  background: rgba(82, 196, 26, 0.2);
-  color: #52C41A;
+  background: rgba(var(--color-success-rgb), 0.2);
+  color: var(--color-success);
 }
 
 .status-badge.pending {
-  background: rgba(255, 125, 0, 0.2);
-  color: #FF7D00;
+  background: rgba(var(--color-orange-rgb), 0.2);
+  color: var(--color-orange);
 }
 
 .status-badge.running {
-  background: rgba(22, 93, 255, 0.2);
-  color: #69B1FF;
+  background: rgba(var(--color-primary-rgb), 0.2);
+  color: var(--color-info-light);
 }
 
 .history-time {
-  font-size: 12px;
-  color: #64748B;
+  font-size: var(--font-size-xs);
+  color: var(--color-text-quaternary);
 }
 
 .history-input {
-  font-size: 14px;
-  color: white;
-  margin-bottom: 12px;
-  padding: 12px;
-  background: rgba(22, 93, 255, 0.1);
-  border-radius: 8px;
-  border-left: 3px solid #165DFF;
+  font-size: var(--font-size-base);
+  color: var(--color-white);
+  margin-bottom: var(--spacing-md);
+  padding: var(--spacing-md);
+  background: rgba(var(--color-primary-rgb), 0.1);
+  border-radius: var(--radius-md);
+  border-left: 3px solid var(--color-primary);
 }
 
 .history-output {
   background: rgba(0, 0, 0, 0.3);
-  border-radius: 8px;
-  padding: 12px;
+  border-radius: var(--radius-md);
+  padding: var(--spacing-md);
 }
 
 .history-output pre {
-  font-size: 12px;
-  color: #52C41A;
+  font-size: var(--font-size-xs);
+  color: var(--color-success);
   white-space: pre-wrap;
   word-break: break-all;
   margin: 0;

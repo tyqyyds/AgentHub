@@ -1,8 +1,9 @@
 from sqlalchemy.ext.asyncio import AsyncSession, create_async_engine
 from sqlalchemy.orm import sessionmaker
-from backend.core.config import settings
+from ..core.config import settings
 
-engine = create_async_engine(settings.postgres_url, echo=False)
+connect_args = {"check_same_thread": False} if settings.environment == "development" else {}
+engine = create_async_engine(settings.database_url, echo=False, connect_args=connect_args)
 async_session_maker = sessionmaker(engine, class_=AsyncSession, expire_on_commit=False)
 
 
