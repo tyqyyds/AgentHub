@@ -1,352 +1,277 @@
-import logging
-import re
-from typing import Any, Dict, List, Optional
-from dataclasses import dataclass, field
-from datetime import datetime, timezone
-
-from ..core.config import settings
-
-logger = logging.getLogger(__name__)
-
-
-@dataclass
-class ConflictRule:
-    """冲突检测规则"""
-    rule_id: str
-    conflict_type: str  # intent / resource / policy / temporal / dependency
-    pattern: str
-    severity: str = "medium"
-    description: str = ""
-
-
-@dataclass
-class ConflictDetectorConfig:
-    """冲突检测配置"""
-    check_intent_conflict: bool = True
-    check_resource_conflict: bool = True
-    check_policy_conflict: bool = True
-    check_temporal_conflict: bool = True
-    check_dependency_conflict: bool = True
-    max_conflict_depth: int = 5
+from typing import Dict, Any, Optional, List
+from backend.agents.base import IntentContext, NetworkState
 
 
 class ConflictDetectorAgent:
-    """冲突检测Agent：意图冲突识别、资源冲突检测、策略冲突分析"""
-
-    def __init__(self, config: Optional[ConflictDetectorConfig] = None):
-        self.config = config or ConflictDetectorConfig()
-        self.logger = logging.getLogger(f"{__name__}.{self.__class__.__name__}")
-        self._active_intents: List[Dict[str, Any]] = []
-        self._resource_locks: Dict[str, Dict[str, Any]] = {}
-        self._policy_rules: List[ConflictRule] = self._init_default_rules()
-
-    def _init_default_rules(self) -> List[ConflictRule]:
-        """初始化默认冲突检测规则"""
-        return [
-            ConflictRule(
-                rule_id="CR001",
-                conflict_type="intent",
-                pattern=r"bandwidth.*(?:guarantee|limit).*bandwidth.*(?:guarantee|limit)",
-                severity="high",
-                description="同一目标上存在多个带宽策略冲突",
-            ),
-            ConflictRule(
-                rule_id="CR002",
-                conflict_type="intent",
-                pattern=r"permit.*deny|deny.*permit",
-                severity="high",
-                description="ACL规则存在允许/拒绝冲突",
-            ),
-            ConflictRule(
-                rule_id="CR003",
-                conflict_type="resource",
-                pattern=r"interface.*(?:shutdown|no shutdown)",
-                severity="medium",
-                description="接口状态操作冲突",
-            ),
-            ConflictRule(
-                rule_id="CR004",
-                conflict_type="policy",
-                pattern=r"route.*(?:add|delete).*route.*(?:add|delete)",
-                severity="medium",
-                description="路由策略操作冲突",
-            ),
-            ConflictRule(
-                rule_id="CR005",
-                conflict_type="intent",
-                pattern=r"qos.*priority.*qos.*priority",
-                severity="high",
-                description="QoS优先级策略冲突",
-            ),
-            ConflictRule(
-                rule_id="CR006",
-                conflict_type="temporal",
-                pattern=r"maintenance.*window|scheduled.*change",
-                severity="high",
-                description="变更操作与维护窗口时间冲突",
-            ),
-            ConflictRule(
-                rule_id="CR007",
-                conflict_type="dependency",
-                pattern=r"upstream.*downstream|depends.*on",
-                severity="medium",
-                description="意图依赖链存在循环或缺失依赖",
-            ),
+    def __init__(self):
+        self.conflict_rules = [
+            self._detect_bandwidth_conflict,
+            self._detect_acl_conflict,
+            self._detect_qos_conflict,
+            self._detect_device_conflict,
+            self._detect_cross_intent_conflict
         ]
+        self._pending_intents: List[Dict[str, Any]] = []
 
-    def register_active_intent(self, intent: Dict[str, Any]) -> None:
-        """注册活跃意图"""
-        self._active_intents.append({
-            **intent,
-            "registered_at": datetime.now(timezone.utc).isoformat(),
-        })
+    def register_pending_intent(self, intent: Dict[str, Any]):
+        self._pending_intents.append(intent)
+        if len(self._pending_intents) > 100:
+            self._pending_intents = self._pending_intents[-100:]
 
-    def remove_active_intent(self, intent_name: str) -> None:
-        """移除活跃意图"""
-        self._active_intents = [
-            i for i in self._active_intents
-            if i.get("intent_name") != intent_name
-        ]
+    def clear_pending_intents(self):
+        self._pending_intents = []
 
-    def _check_intent_conflict(self, intent: Dict[str, Any]) -> List[Dict[str, Any]]:
-        """检测意图冲突"""
+    def detect(self, intent_context: IntentContext, network_state: NetworkState) -> Dict[str, Any]:
         conflicts = []
-        intent_name = intent.get("intent_name", "")
-        targets = intent.get("targets", [])
-        actions = intent.get("actions", [])
 
-        for active in self._active_intents:
-            active_targets = active.get("targets", [])
-            active_actions = active.get("actions", [])
+        for rule in self.conflict_rules:
+            result = rule(intent_context, network_state)
+            if result.get("conflict"):
+                conflicts.append(result)
 
-            target_overlap = set(map(str, targets)) & set(map(str, active_targets))
-            if not target_overlap:
-                continue
-
-            for new_action in actions:
-                for active_action in active_actions:
-                    if new_action.get("type") == active_action.get("type"):
-                        new_params = new_action.get("params", {})
-                        active_params = active_action.get("params", {})
-
-                        if new_action.get("type") == "qos":
-                            new_bw = new_params.get("min_bw") or new_params.get("max_bw")
-                            active_bw = active_params.get("min_bw") or active_params.get("max_bw")
-                            if new_bw and active_bw and new_bw != active_bw:
-                                conflicts.append({
-                                    "type": "intent",
-                                    "severity": "high",
-                                    "description": f"目标 {target_overlap} 上带宽策略冲突: "
-                                                  f"新请求={new_bw}, 已存在={active_bw}",
-                                    "conflicting_intent": active.get("intent_name"),
-                                    "rule_id": "CR001",
-                                })
-
-                        if new_action.get("type") == "acl":
-                            new_effect = new_params.get("effect", "permit")
-                            active_effect = active_params.get("effect", "permit")
-                            if new_effect != active_effect:
-                                conflicts.append({
-                                    "type": "intent",
-                                    "severity": "high",
-                                    "description": f"目标 {target_overlap} 上ACL规则冲突: "
-                                                  f"新请求={new_effect}, 已存在={active_effect}",
-                                    "conflicting_intent": active.get("intent_name"),
-                                    "rule_id": "CR002",
-                                })
-
-        return conflicts
-
-    def _check_resource_conflict(self, intent: Dict[str, Any]) -> List[Dict[str, Any]]:
-        """检测资源冲突"""
-        conflicts = []
-        targets = intent.get("targets", [])
-
-        for target in targets:
-            target_str = str(target)
-            if target_str in self._resource_locks:
-                lock_info = self._resource_locks[target_str]
-                conflicts.append({
-                    "type": "resource",
-                    "severity": "medium",
-                    "description": f"资源 {target_str} 正在被 {lock_info.get('locked_by', 'unknown')} 锁定",
-                    "target": target_str,
-                    "lock_info": lock_info,
-                    "rule_id": "CR003",
-                })
-
-        return conflicts
-
-    def _check_policy_conflict(self, intent: Dict[str, Any]) -> List[Dict[str, Any]]:
-        """检测策略冲突"""
-        conflicts = []
-        actions = intent.get("actions", [])
-
-        for rule in self._policy_rules:
-            if rule.conflict_type != "policy":
-                continue
-
-            action_text = " ".join(
-                f"{a.get('type')} {a.get('params')}" for a in actions
-            )
-
-            if re.search(rule.pattern, action_text, re.IGNORECASE):
-                conflicts.append({
-                    "type": "policy",
-                    "severity": rule.severity,
-                    "description": rule.description,
-                    "rule_id": rule.rule_id,
-                })
-
-        return conflicts
-
-    def _check_temporal_conflict(self, intent: Dict[str, Any]) -> List[Dict[str, Any]]:
-        """检测时序冲突：变更操作与维护窗口或已有调度冲突"""
-        conflicts = []
-        actions = intent.get("actions", [])
-        scheduled_time = intent.get("scheduled_time")
-        targets = intent.get("targets", [])
-
-        # 检查是否在维护窗口内
-        for rule in self._policy_rules:
-            if rule.conflict_type != "temporal":
-                continue
-            action_text = " ".join(
-                f"{a.get('type')} {a.get('params')}" for a in actions
-            )
-            if scheduled_time and re.search(rule.pattern, action_text, re.IGNORECASE):
-                conflicts.append({
-                    "type": "temporal",
-                    "severity": rule.severity,
-                    "description": rule.description,
-                    "scheduled_time": scheduled_time,
-                    "targets": [str(t) for t in targets],
-                    "rule_id": rule.rule_id,
-                })
-
-        # 检查活跃意图的时间重叠
-        if scheduled_time:
-            for active in self._active_intents:
-                active_time = active.get("scheduled_time")
-                active_targets = set(map(str, active.get("targets", [])))
-                current_targets = set(map(str, targets))
-                if active_time and active_targets & current_targets:
-                    conflicts.append({
-                        "type": "temporal",
-                        "severity": "medium",
-                        "description": f"目标 {active_targets & current_targets} 在 {active_time} 已有调度",
-                        "conflicting_intent": active.get("intent_name"),
-                        "rule_id": "CR006",
-                    })
-
-        return conflicts
-
-    def _check_dependency_conflict(self, intent: Dict[str, Any]) -> List[Dict[str, Any]]:
-        """检测依赖冲突：意图依赖链循环或缺失上游依赖"""
-        conflicts = []
-        dependencies = intent.get("dependencies", [])
-        intent_name = intent.get("intent_name", "")
-
-        # 检查循环依赖
-        if dependencies:
-            dep_names = set(d if isinstance(d, str) else d.get("name", "") for d in dependencies)
-            active_names = {a.get("intent_name", "") for a in self._active_intents}
-            if intent_name in dep_names:
-                conflicts.append({
-                    "type": "dependency",
-                    "severity": "high",
-                    "description": f"意图 {intent_name} 存在自依赖循环",
-                    "rule_id": "CR007",
-                })
-            # 检查上游意图是否已完成
-            for dep in dependencies:
-                dep_name = dep if isinstance(dep, str) else dep.get("name", "")
-                if dep_name and dep_name not in active_names:
-                    # 上游意图不在活跃列表中，可能已完成或不存在
-                    pass  # 非阻塞，仅记录
-
-        # 检查策略规则匹配
-        actions = intent.get("actions", [])
-        for rule in self._policy_rules:
-            if rule.conflict_type != "dependency":
-                continue
-            action_text = " ".join(
-                f"{a.get('type')} {a.get('params')}" for a in actions
-            )
-            if re.search(rule.pattern, action_text, re.IGNORECASE):
-                conflicts.append({
-                    "type": "dependency",
-                    "severity": rule.severity,
-                    "description": rule.description,
-                    "rule_id": rule.rule_id,
-                })
-
-        return conflicts
-
-    def lock_resource(self, target: str, locked_by: str, ttl_seconds: int = 300) -> None:
-        """锁定资源"""
-        self._resource_locks[target] = {
-            "locked_by": locked_by,
-            "locked_at": datetime.now(timezone.utc).isoformat(),
-            "ttl_seconds": ttl_seconds,
-        }
-        self.logger.info(f"资源已锁定: {target}, 锁定者: {locked_by}")
-
-    def unlock_resource(self, target: str) -> None:
-        """解锁资源"""
-        self._resource_locks.pop(target, None)
-        self.logger.info(f"资源已解锁: {target}")
-
-    async def process(self, input_data: Dict[str, Any]) -> Dict[str, Any]:
-        """执行冲突检测"""
-        intent = input_data.get("intent", input_data)
-        all_conflicts = []
-
-        if self.config.check_intent_conflict:
-            intent_conflicts = self._check_intent_conflict(intent)
-            all_conflicts.extend(intent_conflicts)
-
-        if self.config.check_resource_conflict:
-            resource_conflicts = self._check_resource_conflict(intent)
-            all_conflicts.extend(resource_conflicts)
-
-        if self.config.check_policy_conflict:
-            policy_conflicts = self._check_policy_conflict(intent)
-            all_conflicts.extend(policy_conflicts)
-
-        if self.config.check_temporal_conflict:
-            temporal_conflicts = self._check_temporal_conflict(intent)
-            all_conflicts.extend(temporal_conflicts)
-
-        if self.config.check_dependency_conflict:
-            dependency_conflicts = self._check_dependency_conflict(intent)
-            all_conflicts.extend(dependency_conflicts)
-
-        high_severity = [c for c in all_conflicts if c.get("severity") == "high"]
-        has_blocking = len(high_severity) > 0
-
-        result = {
-            "has_conflict": len(all_conflicts) > 0,
-            "is_blocking": has_blocking,
-            "total_conflicts": len(all_conflicts),
-            "high_severity_count": len(high_severity),
-            "conflicts": all_conflicts,
-            "recommendation": "需要人工审批" if has_blocking else "可自动执行",
-        }
-
-        self.logger.info(
-            f"冲突检测完成: 发现{len(all_conflicts)}个冲突, "
-            f"其中高危{len(high_severity)}个"
-        )
-
-        return result
-
-    async def health_check(self) -> Dict[str, Any]:
-        """健康检查"""
         return {
-            "status": "healthy",
-            "agent": self.__class__.__name__,
-            "active_intents": len(self._active_intents),
-            "resource_locks": len(self._resource_locks),
-            "policy_rules": len(self._policy_rules),
+            "conflict": len(conflicts) > 0,
+            "conflicts": conflicts,
+            "details": "\n".join([c["message"] for c in conflicts]) if conflicts else None,
+            "suggestions": self._generate_suggestions(conflicts)
         }
+
+    def _detect_bandwidth_conflict(self, intent: IntentContext, network: NetworkState) -> Dict[str, Any]:
+        if intent.parsed_intent.get("intent_type") != "bandwidth_guarantee":
+            return {"conflict": False}
+
+        target_subnet = intent.parsed_intent.get("target_subnet")
+        requested_bw = intent.parsed_intent.get("bandwidth", 0)
+
+        for policy in network.qos_policies:
+            if policy.get("subnet") == target_subnet:
+                existing_bw = policy.get("bandwidth", 0)
+
+                if existing_bw > 0 and requested_bw > existing_bw:
+                    return {
+                        "conflict": True,
+                        "type": "bandwidth_overcommit",
+                        "message": f"目标子网 '{target_subnet}' 已有带宽保障 {existing_bw}M，当前请求 {requested_bw}M，可能存在带宽超额"
+                    }
+
+                if policy.get("action") == "limit" and intent.parsed_intent.get("priority") == "high":
+                    return {
+                        "conflict": True,
+                        "type": "policy_conflict",
+                        "message": f"目标子网 '{target_subnet}' 存在限流策略，与高优先级带宽保障冲突"
+                    }
+
+        return {"conflict": False}
+
+    def _detect_acl_conflict(self, intent: IntentContext, network: NetworkState) -> Dict[str, Any]:
+        if intent.parsed_intent.get("intent_name") != "access_control":
+            return {"conflict": False}
+
+        new_action = intent.parsed_intent.get("action", "permit")
+        new_source = intent.parsed_intent.get("source", "any")
+        new_destination = intent.parsed_intent.get("destination", "any")
+        new_protocol = intent.parsed_intent.get("protocol", "ip")
+        target_device = intent.parsed_intent.get("device", "")
+
+        acl_policies = [p for p in network.qos_policies if p.get("policy_type") == "acl"]
+
+        for policy in acl_policies:
+            if policy.get("device", "") != target_device:
+                continue
+
+            existing_action = policy.get("action", "permit")
+            existing_source = policy.get("source", "any")
+            existing_destination = policy.get("destination", "any")
+            existing_protocol = policy.get("protocol", "ip")
+
+            if self._addresses_overlap(new_source, existing_source) and \
+               self._addresses_overlap(new_destination, existing_destination) and \
+               (new_protocol == existing_protocol or new_protocol == "ip" or existing_protocol == "ip"):
+                if new_action != existing_action:
+                    return {
+                        "conflict": True,
+                        "type": "acl_action_conflict",
+                        "message": f"设备 '{target_device}' 上存在冲突的ACL规则：已有 {existing_action} {existing_protocol} {existing_source}->{existing_destination}，新请求 {new_action} {new_protocol} {new_source}->{new_destination}"
+                    }
+
+                if existing_action == "deny" and new_action == "deny":
+                    return {
+                        "conflict": True,
+                        "type": "acl_redundant",
+                        "message": f"设备 '{target_device}' 上存在重复的ACL拒绝规则：{existing_protocol} {existing_source}->{existing_destination}"
+                    }
+
+        if new_action == "deny" and new_source == "any" and new_destination == "any":
+            return {
+                "conflict": True,
+                "type": "acl_overly_broad",
+                "message": f"设备 '{target_device}' 上的ACL拒绝规则过于宽泛（any->any），可能阻断所有流量"
+            }
+
+        return {"conflict": False}
+
+    def _detect_qos_conflict(self, intent: IntentContext, network: NetworkState) -> Dict[str, Any]:
+        intent_type = intent.parsed_intent.get("intent_name")
+
+        if intent_type not in ["bandwidth_guarantee", "qos_policy", "traffic_shaping"]:
+            return {"conflict": False}
+
+        target_subnet = intent.parsed_intent.get("target_subnet")
+        new_priority = intent.parsed_intent.get("priority", "medium")
+
+        priorities = {"high": 3, "medium": 2, "low": 1}
+
+        for policy in network.qos_policies:
+            if policy.get("subnet") == target_subnet:
+                existing_priority = policy.get("priority", "medium")
+
+                if priorities.get(new_priority, 2) > priorities.get(existing_priority, 2):
+                    return {
+                        "conflict": True,
+                        "type": "priority_increase",
+                        "message": f"目标子网 '{target_subnet}' 将从 {existing_priority} 优先级升级为 {new_priority}，可能影响其他业务"
+                    }
+
+            if policy.get("subnet") and target_subnet and self._subnets_overlap(policy.get("subnet", ""), target_subnet):
+                if policy.get("action") == "limit" and intent.parsed_intent.get("priority") == "high":
+                    return {
+                        "conflict": True,
+                        "type": "cross_subnet_qos_conflict",
+                        "message": f"重叠子网 '{policy.get('subnet')}' 与 '{target_subnet}' 存在QoS策略冲突：限流 vs 高优先级保障"
+                    }
+
+        return {"conflict": False}
+
+    def _detect_device_conflict(self, intent: IntentContext, network: NetworkState) -> Dict[str, Any]:
+        target_devices = set(intent.target_devices)
+        if not target_devices:
+            target_devices = {intent.parsed_intent.get("device", "")} if intent.parsed_intent.get("device") else set()
+
+        if not target_devices:
+            return {"conflict": False}
+
+        for device_name in target_devices:
+            device_info = None
+            for device in network.devices:
+                if device.name == device_name:
+                    device_info = device
+                    break
+
+            if device_info and device_info.status == "critical":
+                return {
+                    "conflict": True,
+                    "type": "device_critical",
+                    "message": f"设备 '{device_name}' 当前状态为 critical，不建议执行配置变更"
+                }
+
+        for pending in self._pending_intents:
+            pending_id = pending.get("intent_id", "")
+            if pending_id == intent.intent_id:
+                continue
+
+            pending_devices = set(pending.get("target_devices", []))
+            if not pending_devices:
+                pd = pending.get("parsed_intent", {}).get("device", "")
+                if pd:
+                    pending_devices = {pd}
+
+            overlap = target_devices & pending_devices
+            if overlap:
+                return {
+                    "conflict": True,
+                    "type": "concurrent_device_access",
+                    "message": f"设备 {overlap} 正在被意图 '{pending_id}' 操作，同时配置可能导致不可预期结果"
+                }
+
+        return {"conflict": False}
+
+    def _detect_cross_intent_conflict(self, intent: IntentContext, network: NetworkState) -> Dict[str, Any]:
+        intent_type = intent.parsed_intent.get("intent_type")
+        target_subnet = intent.parsed_intent.get("target_subnet")
+
+        if not intent_type or not target_subnet:
+            return {"conflict": False}
+
+        for pending in self._pending_intents:
+            pending_id = pending.get("intent_id", "")
+            if pending_id == intent.intent_id:
+                continue
+
+            pending_type = pending.get("parsed_intent", {}).get("intent_name", "")
+            pending_subnet = pending.get("parsed_intent", {}).get("target_subnet", "")
+
+            if not pending_subnet or not self._subnets_overlap(target_subnet, pending_subnet):
+                continue
+
+            conflicting_pairs = {
+                ("bandwidth_guarantee", "traffic_shaping"),
+                ("traffic_shaping", "bandwidth_guarantee"),
+                ("access_control", "bandwidth_guarantee"),
+                ("bandwidth_guarantee", "access_control"),
+            }
+
+            if (intent_type, pending_type) in conflicting_pairs:
+                return {
+                    "conflict": True,
+                    "type": "cross_intent_conflict",
+                    "message": f"意图 '{pending_id}'（{pending_type}）与当前意图（{intent_type}）在子网 '{target_subnet}' 上存在策略冲突"
+                }
+
+        return {"conflict": False}
+
+    def _addresses_overlap(self, addr1: str, addr2: str) -> bool:
+        if addr1 == "any" or addr2 == "any":
+            return True
+        if addr1 == addr2:
+            return True
+        if "/" in addr1 and "/" in addr2:
+            return self._subnets_overlap(addr1, addr2)
+        return False
+
+    def _subnets_overlap(self, subnet1: str, subnet2: str) -> bool:
+        if subnet1 == subnet2:
+            return True
+        if "any" in (subnet1, subnet2):
+            return True
+        try:
+            import ipaddress
+            net1 = ipaddress.ip_network(subnet1, strict=False)
+            net2 = ipaddress.ip_network(subnet2, strict=False)
+            return net1.overlaps(net2)
+        except Exception:
+            return subnet1 == subnet2
+
+    def _generate_suggestions(self, conflicts: List[Dict[str, Any]]) -> List[str]:
+        suggestions = []
+
+        for conflict in conflicts:
+            ctype = conflict.get("type", "")
+            if ctype == "bandwidth_overcommit":
+                suggestions.append("建议：检查链路实际带宽容量，考虑是否需要扩容")
+                suggestions.append("建议：调整保障带宽值，避免超额承诺")
+            elif ctype == "policy_conflict":
+                suggestions.append("建议：先取消或调整现有限流策略")
+                suggestions.append("建议：评估两种策略的优先级关系")
+            elif ctype == "priority_increase":
+                suggestions.append("建议：通知相关业务方优先级变更")
+                suggestions.append("建议：评估高优先级策略的影响范围")
+            elif ctype == "acl_action_conflict":
+                suggestions.append("建议：检查现有ACL规则，确认是否需要替换或合并")
+                suggestions.append("建议：使用更精确的源/目标地址避免冲突")
+            elif ctype == "acl_redundant":
+                suggestions.append("建议：移除重复的ACL拒绝规则")
+            elif ctype == "acl_overly_broad":
+                suggestions.append("建议：缩小ACL拒绝规则的地址范围，避免全局阻断")
+            elif ctype == "device_critical":
+                suggestions.append("建议：等待设备恢复正常后再执行配置变更")
+                suggestions.append("建议：联系运维人员检查设备状态")
+            elif ctype == "concurrent_device_access":
+                suggestions.append("建议：等待其他意图完成后再操作同一设备")
+                suggestions.append("建议：将多个意图合并为一个批量操作")
+            elif ctype == "cross_subnet_qos_conflict":
+                suggestions.append("建议：检查重叠子网的QoS策略一致性")
+            elif ctype == "cross_intent_conflict":
+                suggestions.append("建议：按顺序执行冲突意图，避免并行操作")
+                suggestions.append("建议：调整意图的目标范围，消除重叠")
+
+        return suggestions

@@ -1,129 +1,213 @@
 from fastapi import APIRouter, Depends, HTTPException, Query
-from sqlalchemy.ext.asyncio import AsyncSession
-from sqlalchemy import select
-from pydantic import BaseModel
-from typing import Optional
-from ..database.connection import get_db_session
-from ..database.models import IntentTemplate, IntentTemplateType
-from .deps import get_current_user
+from pydantic import BaseModel, Field
+from typing import Optional, List, Dict, Any
+from backend.core.security.rbac import get_current_user, requires_permission
+from backend.agents.intent_template_manager import get_intent_template_manager
+from backend.api.response import success_response
+import logging
+
+logger = logging.getLogger(__name__)
 
 router = APIRouter()
 
 
-class TemplateCreate(BaseModel):
-    template_id: str
-    intent_type: str
-    description: Optional[str] = None
-    param_schema: Optional[dict] = None
-    example_utterances: Optional[list] = None
+class CreateTemplateRequest(BaseModel):
+    name: str = Field(..., min_length=1, max_length=200)
+    description: str = Field(..., min_length=1)
+    category: str = Field(..., min_length=1)
+    intent_type: str = Field(..., min_length=1)
+    template_content: str = Field(..., min_length=1)
+    parameters_schema: List[Dict[str, Any]] = Field(...)
+    example_values: Optional[Dict[str, Any]] = None
+    sla_template: Optional[Dict[str, Any]] = None
+    priority: str = "medium"
+    is_public: bool = True
+    tags: List[str] = []
 
 
-class TemplateUpdate(BaseModel):
-    intent_type: Optional[str] = None
-    description: Optional[str] = None
-    param_schema: Optional[dict] = None
-    example_utterances: Optional[list] = None
+class UpdateTemplateRequest(BaseModel):
+    name: Optional[str] = Field(None, min_length=1, max_length=200)
+    description: Optional[str] = Field(None, min_length=1)
+    category: Optional[str] = Field(None, min_length=1)
+    intent_type: Optional[str] = Field(None, min_length=1)
+    template_content: Optional[str] = Field(None, min_length=1)
+    parameters_schema: Optional[List[Dict[str, Any]]] = None
+    example_values: Optional[Dict[str, Any]] = None
+    sla_template: Optional[Dict[str, Any]] = None
+    priority: Optional[str] = None
+    is_public: Optional[bool] = None
+    tags: Optional[List[str]] = None
 
 
-@router.get("/")
+class InstantiateRequest(BaseModel):
+    parameter_values: Dict[str, Any] = Field(default_factory=dict)
+
+
+class RateRequest(BaseModel):
+    rating: float = Field(..., ge=0.0, le=5.0)
+
+
+class CloneRequest(BaseModel):
+    pass
+
+
+@router.get("")
 async def list_templates(
+    category: Optional[str] = Query(None),
     intent_type: Optional[str] = Query(None),
-    skip: int = Query(0, ge=0),
+    is_public: Optional[bool] = Query(None),
+    author: Optional[str] = Query(None),
+    search: Optional[str] = Query(None),
     limit: int = Query(20, ge=1, le=100),
-    db: AsyncSession = Depends(get_db_session),
+    offset: int = Query(0, ge=0),
     current_user=Depends(get_current_user),
 ):
-    query = select(IntentTemplate)
-    if intent_type:
-        query = query.where(IntentTemplate.intent_type == intent_type)
-    query = query.offset(skip).limit(limit)
-    result = await db.execute(query)
-    templates = result.scalars().all()
-    return {"status": "success", "data": [{"id": t.id, "template_id": t.template_id, "intent_type": t.intent_type.value if t.intent_type else None, "description": t.description, "param_schema": t.param_schema, "example_utterances": t.example_utterances, "created_at": t.created_at.isoformat() if t.created_at else None} for t in templates]}
+    manager = get_intent_template_manager()
+    templates = await manager.list_templates(
+        category=category,
+        intent_type=intent_type,
+        is_public=is_public,
+        author=author,
+        search=search,
+        limit=limit,
+        offset=offset,
+    )
+    return success_response(data=templates)
+
+
+@router.get("/categories")
+async def get_categories(current_user=Depends(get_current_user)):
+    manager = get_intent_template_manager()
+    categories = await manager.get_categories()
+    return success_response(data=categories)
+
+
+@router.get("/popular")
+async def get_popular_templates(
+    limit: int = Query(10, ge=1, le=50),
+    current_user=Depends(get_current_user),
+):
+    manager = get_intent_template_manager()
+    templates = await manager.get_popular_templates(limit=limit)
+    return success_response(data=templates)
 
 
 @router.get("/{template_id}")
 async def get_template(
-    template_id: int,
-    db: AsyncSession = Depends(get_db_session),
+    template_id: str,
     current_user=Depends(get_current_user),
 ):
-    result = await db.execute(select(IntentTemplate).where(IntentTemplate.id == template_id))
-    template = result.scalar_one_or_none()
+    manager = get_intent_template_manager()
+    template = await manager.get_template(template_id)
     if not template:
-        raise HTTPException(status_code=404, detail="Intent template not found")
-    return {"status": "success", "data": {"id": template.id, "template_id": template.template_id, "intent_type": template.intent_type.value if template.intent_type else None, "description": template.description, "param_schema": template.param_schema, "example_utterances": template.example_utterances, "created_at": template.created_at.isoformat() if template.created_at else None}}
+        raise HTTPException(status_code=404, detail="模板不存在")
+    return success_response(data=template)
 
 
-@router.post("/")
+@router.post("")
 async def create_template(
-    req: TemplateCreate,
-    db: AsyncSession = Depends(get_db_session),
+    req: CreateTemplateRequest,
     current_user=Depends(get_current_user),
+    _: None = Depends(requires_permission("playbook:create")),
 ):
-    existing = await db.execute(select(IntentTemplate).where(IntentTemplate.template_id == req.template_id))
-    if existing.scalar_one_or_none():
-        raise HTTPException(status_code=400, detail="Template ID already exists")
-    template = IntentTemplate(
-        template_id=req.template_id,
-        intent_type=IntentTemplateType(req.intent_type),
+    manager = get_intent_template_manager()
+    template = await manager.create_template(
+        name=req.name,
         description=req.description,
-        param_schema=req.param_schema,
-        example_utterances=req.example_utterances,
+        category=req.category,
+        intent_type=req.intent_type,
+        template_content=req.template_content,
+        parameters_schema=req.parameters_schema,
+        author=current_user.username,
+        example_values=req.example_values,
+        sla_template=req.sla_template,
+        priority=req.priority,
+        is_public=req.is_public,
+        tags=req.tags,
     )
-    db.add(template)
-    await db.commit()
-    await db.refresh(template)
-    return {"status": "success", "data": {"id": template.id}}
+    from backend.agents.intent_template_manager import _template_to_dict
+    return success_response(data=_template_to_dict(template))
 
 
 @router.put("/{template_id}")
 async def update_template(
-    template_id: int,
-    req: TemplateUpdate,
-    db: AsyncSession = Depends(get_db_session),
+    template_id: str,
+    req: UpdateTemplateRequest,
     current_user=Depends(get_current_user),
+    _: None = Depends(requires_permission("playbook:manage")),
 ):
-    result = await db.execute(select(IntentTemplate).where(IntentTemplate.id == template_id))
-    template = result.scalar_one_or_none()
-    if not template:
-        raise HTTPException(status_code=404, detail="Intent template not found")
-    if req.intent_type is not None:
-        template.intent_type = IntentTemplateType(req.intent_type)
-    if req.description is not None:
-        template.description = req.description
-    if req.param_schema is not None:
-        template.param_schema = req.param_schema
-    if req.example_utterances is not None:
-        template.example_utterances = req.example_utterances
-    await db.commit()
-    return {"status": "success", "data": {"id": template.id}}
+    manager = get_intent_template_manager()
+    existing = await manager.get_template(template_id)
+    if not existing:
+        raise HTTPException(status_code=404, detail="模板不存在")
+    if existing["author"] != current_user.username and current_user.role != "admin":
+        raise HTTPException(status_code=403, detail="无权修改此模板")
+    update_data = {k: v for k, v in req.model_dump().items() if v is not None}
+    result = await manager.update_template(template_id, **update_data)
+    return success_response(data=result)
 
 
 @router.delete("/{template_id}")
 async def delete_template(
-    template_id: int,
-    db: AsyncSession = Depends(get_db_session),
+    template_id: str,
     current_user=Depends(get_current_user),
+    _: None = Depends(requires_permission("playbook:manage")),
 ):
-    result = await db.execute(select(IntentTemplate).where(IntentTemplate.id == template_id))
-    template = result.scalar_one_or_none()
-    if not template:
-        raise HTTPException(status_code=404, detail="Intent template not found")
-    await db.delete(template)
-    await db.commit()
-    return {"status": "success", "message": "Deleted"}
+    manager = get_intent_template_manager()
+    existing = await manager.get_template(template_id)
+    if not existing:
+        raise HTTPException(status_code=404, detail="模板不存在")
+    if existing["author"] != current_user.username and current_user.role != "admin":
+        raise HTTPException(status_code=403, detail="无权删除此模板")
+    success = await manager.delete_template(template_id)
+    if not success:
+        raise HTTPException(status_code=500, detail="删除模板失败")
+    return success_response(data={"template_id": template_id, "deleted": True})
 
 
-@router.post("/render")
-async def render_template(
-    template_id: str = Query(..., description="Template string ID to render"),
-    params: Optional[dict] = None,
-    db: AsyncSession = Depends(get_db_session),
+@router.post("/{template_id}/instantiate")
+async def instantiate_template(
+    template_id: str,
+    req: InstantiateRequest,
+    current_user=Depends(get_current_user),
+    _: None = Depends(requires_permission("intents:execute")),
+):
+    manager = get_intent_template_manager()
+    result = await manager.instantiate_template(template_id, req.parameter_values)
+    if result is None:
+        raise HTTPException(status_code=404, detail="模板不存在")
+    if "error" in result:
+        raise HTTPException(status_code=400, detail=result["error"])
+    return success_response(data=result)
+
+
+@router.post("/{template_id}/rate")
+async def rate_template(
+    template_id: str,
+    req: RateRequest,
     current_user=Depends(get_current_user),
 ):
-    result = await db.execute(select(IntentTemplate).where(IntentTemplate.template_id == template_id))
-    template = result.scalar_one_or_none()
-    if not template:
-        raise HTTPException(status_code=404, detail="Template not found")
-    return {"status": "success", "data": {"template_id": template.template_id, "intent_type": template.intent_type.value if template.intent_type else None, "param_schema": template.param_schema, "provided_params": params or {}}}
+    manager = get_intent_template_manager()
+    result = await manager.rate_template(template_id, req.rating)
+    if result is None:
+        raise HTTPException(status_code=404, detail="模板不存在")
+    return success_response(data=result)
+
+
+@router.post("/{template_id}/clone")
+async def clone_template(
+    template_id: str,
+    current_user=Depends(get_current_user),
+    _: None = Depends(requires_permission("playbook:create")),
+):
+    manager = get_intent_template_manager()
+    existing = await manager.get_template(template_id)
+    if not existing:
+        raise HTTPException(status_code=404, detail="模板不存在")
+    if not existing["is_public"] and existing["author"] != current_user.username and current_user.role != "admin":
+        raise HTTPException(status_code=403, detail="无权克隆此私有模板")
+    cloned = await manager.clone_template(template_id, current_user.username)
+    if cloned is None:
+        raise HTTPException(status_code=500, detail="克隆模板失败")
+    from backend.agents.intent_template_manager import _template_to_dict
+    return success_response(data=_template_to_dict(cloned))

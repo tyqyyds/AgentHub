@@ -1,446 +1,657 @@
-import logging
-import asyncio
-import random
-from typing import Any, Dict, List, Optional
-from dataclasses import dataclass, field
+from typing import List, Dict, Optional
 from datetime import datetime, timezone
-from enum import Enum as PyEnum
-
-from ..core.config import settings
-from ..database.models import GrayscalePhase, GrayscaleTaskStatus
+from sqlalchemy import select
+from backend.database.connection import async_session_maker
+from backend.database.models import GrayscaleHealingTask, HealingEvaluation, SelfHealingEvent
+from backend.core.config import settings
+import asyncio
+import uuid
+import logging
+import json
 
 logger = logging.getLogger(__name__)
 
 
-class CanaryCheckResult(PyEnum):
-    """金丝雀检查结果"""
-    PASSED = "passed"
-    FAILED = "failed"
-    TIMEOUT = "timeout"
+def _generate_id(prefix: str) -> str:
+    return f"{prefix}_{uuid.uuid4().hex[:8]}"
 
 
-class RollbackReason(PyEnum):
-    """回滚原因"""
-    CANARY_FAILED = "canary_failed"
-    METRICS_DEGRADED = "metrics_degraded"
-    MANUAL_TRIGGER = "manual_trigger"
-    TIMEOUT = "timeout"
+def _serialize_task(task: GrayscaleHealingTask) -> dict:
+    return {
+        "id": task.id,
+        "task_id": task.task_id,
+        "event_id": task.event_id,
+        "target_devices": task.target_devices,
+        "canary_device": task.canary_device,
+        "canary_status": task.canary_status,
+        "canary_result": task.canary_result,
+        "canary_started_at": task.canary_started_at.isoformat() if task.canary_started_at else None,
+        "canary_completed_at": task.canary_completed_at.isoformat() if task.canary_completed_at else None,
+        "batch_status": task.batch_status,
+        "batch_progress": task.batch_progress,
+        "batch_completed_devices": task.batch_completed_devices,
+        "batch_failed_devices": task.batch_failed_devices,
+        "batch_started_at": task.batch_started_at.isoformat() if task.batch_started_at else None,
+        "batch_completed_at": task.batch_completed_at.isoformat() if task.batch_completed_at else None,
+        "rollback_triggered": task.rollback_triggered,
+        "rollback_reason": task.rollback_reason,
+        "overall_status": task.overall_status,
+        "created_by": task.created_by,
+        "created_at": task.created_at.isoformat() if task.created_at else None,
+        "updated_at": task.updated_at.isoformat() if task.updated_at else None,
+    }
 
 
-@dataclass
-class CanaryMetrics:
-    """金丝雀验证指标"""
-    latency_p50_ms: float = 0.0
-    latency_p99_ms: float = 0.0
-    packet_loss_rate: float = 0.0
-    cpu_usage_percent: float = 0.0
-    memory_usage_percent: float = 0.0
-    error_rate: float = 0.0
+def _serialize_evaluation(ev: HealingEvaluation) -> dict:
+    return {
+        "id": ev.id,
+        "evaluation_id": ev.evaluation_id,
+        "event_id": ev.event_id,
+        "task_id": ev.task_id,
+        "metrics_before": ev.metrics_before,
+        "metrics_after": ev.metrics_after,
+        "healing_action": ev.healing_action,
+        "effectiveness_score": ev.effectiveness_score,
+        "root_cause_analysis": ev.root_cause_analysis,
+        "side_effects": ev.side_effects,
+        "recommendation": ev.recommendation,
+        "evaluated_at": ev.evaluated_at.isoformat() if ev.evaluated_at else None,
+        "created_at": ev.created_at.isoformat() if ev.created_at else None,
+    }
 
 
-@dataclass
-class GrayscaleStepResult:
-    """灰度步骤结果"""
-    phase: GrayscalePhase = GrayscalePhase.CANARY
-    device: str = ""
-    success: bool = False
-    metrics_before: Optional[CanaryMetrics] = None
-    metrics_after: Optional[CanaryMetrics] = None
-    duration_ms: int = 0
-    error: Optional[str] = None
+class GrayscaleHealingEngine:
+    def __init__(self):
+        self._running_tasks: Dict[str, asyncio.Task] = {}
 
-
-@dataclass
-class GrayscaleHealingConfig:
-    """灰度自愈Agent配置"""
-    canary_percentage: float = field(
-        default_factory=lambda: settings.grayscale_canary_percentage
-    )
-    batch_size: int = field(
-        default_factory=lambda: settings.grayscale_batch_size
-    )
-    observation_period_seconds: int = field(
-        default_factory=lambda: settings.grayscale_observation_period_seconds
-    )
-    auto_rollback_enabled: bool = field(
-        default_factory=lambda: settings.auto_rollback_enabled
-    )
-    max_canary_retries: int = 2
-    metrics_degradation_threshold: float = 0.3
-    latency_increase_threshold_percent: float = 50.0
-    error_rate_threshold: float = 0.05
-
-
-# ── 金丝雀验证指标基线 ──
-BASELINE_METRICS = CanaryMetrics(
-    latency_p50_ms=15.0,
-    latency_p99_ms=45.0,
-    packet_loss_rate=0.001,
-    cpu_usage_percent=35.0,
-    memory_usage_percent=40.0,
-    error_rate=0.002,
-)
-
-
-class GrayscaleHealingAgent:
-    """灰度自愈Agent：金丝雀验证 → 批量执行 → 自动回滚
-
-    核心流程：
-    1. 金丝雀阶段(canary)：选取少量设备执行变更，观察指标
-    2. 批量阶段(batch)：金丝雀通过后，分批对剩余设备执行变更
-    3. 回滚阶段(rollback)：任一阶段指标异常，自动回滚已变更设备
-    """
-
-    def __init__(self, config: Optional[GrayscaleHealingConfig] = None):
-        self.config = config or GrayscaleHealingConfig()
-        self.logger = logging.getLogger(f"{__name__}.{self.__class__.__name__}")
-        self._active_tasks: Dict[str, Dict[str, Any]] = {}
-        self._rollback_history: List[Dict[str, Any]] = []
-
-    def _select_canary_devices(
-        self, all_devices: List[str], percentage: Optional[float] = None
-    ) -> List[str]:
-        """选择金丝雀设备"""
-        pct = percentage or self.config.canary_percentage
-        count = max(1, int(len(all_devices) * pct))
-        return random.sample(all_devices, min(count, len(all_devices)))
-
-    def _select_batch_devices(
+    async def create_task(
         self,
-        all_devices: List[str],
-        canary_devices: List[str],
-        batch_index: int,
-    ) -> List[str]:
-        """选择批量执行设备"""
-        remaining = [d for d in all_devices if d not in canary_devices]
-        start = batch_index * self.config.batch_size
-        end = start + self.config.batch_size
-        return remaining[start:end]
-
-    async def _collect_metrics(self, device: str) -> CanaryMetrics:
-        """采集设备指标（模拟）"""
-        await asyncio.sleep(0.1)
-        jitter = random.uniform(-0.1, 0.1)
-        return CanaryMetrics(
-            latency_p50_ms=BASELINE_METRICS.latency_p50_ms * (1 + jitter),
-            latency_p99_ms=BASELINE_METRICS.latency_p99_ms * (1 + jitter),
-            packet_loss_rate=max(0, BASELINE_METRICS.packet_loss_rate * (1 + jitter * 5)),
-            cpu_usage_percent=BASELINE_METRICS.cpu_usage_percent * (1 + jitter),
-            memory_usage_percent=BASELINE_METRICS.memory_usage_percent * (1 + jitter),
-            error_rate=max(0, BASELINE_METRICS.error_rate * (1 + jitter * 3)),
-        )
-
-    def _evaluate_canary(
-        self, before: CanaryMetrics, after: CanaryMetrics
-    ) -> CanaryCheckResult:
-        """评估金丝雀结果"""
-        latency_increase = (
-            (after.latency_p99_ms - before.latency_p99_ms) / before.latency_p99_ms * 100
-            if before.latency_p99_ms > 0 else 0
-        )
-        if latency_increase > self.config.latency_increase_threshold_percent:
-            self.logger.warning(
-                f"金丝雀验证失败: 延迟增长 {latency_increase:.1f}% "
-                f"超过阈值 {self.config.latency_increase_threshold_percent}%"
+        event_id: int,
+        target_devices: list,
+        canary_device: str,
+        created_by: str,
+    ) -> GrayscaleHealingTask:
+        async with async_session_maker() as session:
+            task_id = _generate_id("gs")
+            task = GrayscaleHealingTask(
+                task_id=task_id,
+                event_id=event_id,
+                target_devices=target_devices,
+                canary_device=canary_device,
+                created_by=created_by,
             )
-            return CanaryCheckResult.FAILED
+            session.add(task)
+            await session.commit()
+            await session.refresh(task)
+            logger.info(f"Created grayscale healing task {task_id} for event {event_id}")
+            return task
 
-        if after.error_rate > self.config.error_rate_threshold:
-            self.logger.warning(
-                f"金丝雀验证失败: 错误率 {after.error_rate:.4f} "
-                f"超过阈值 {self.config.error_rate_threshold}"
+    async def execute_canary(self, task_id: str) -> dict:
+        async with async_session_maker() as session:
+            result = await session.execute(
+                select(GrayscaleHealingTask).where(GrayscaleHealingTask.task_id == task_id)
             )
-            return CanaryCheckResult.FAILED
+            task = result.scalar_one_or_none()
+            if task is None:
+                raise ValueError(f"Task not found: {task_id}")
 
-        if after.packet_loss_rate > before.packet_loss_rate * (
-            1 + self.config.metrics_degradation_threshold
-        ):
-            self.logger.warning("金丝雀验证失败: 丢包率显著上升")
-            return CanaryCheckResult.FAILED
+            task.canary_status = "running"
+            task.overall_status = "canary_running"
+            task.canary_started_at = datetime.now(timezone.utc)
+            await session.commit()
 
-        return CanaryCheckResult.PASSED
+            event_id = task.event_id
+            canary_device = task.canary_device
 
-    async def _execute_on_device(
-        self, device: str, commands: List[str]
-    ) -> GrayscaleStepResult:
-        """在设备上执行命令"""
-        start_time = datetime.now(timezone.utc)
-        metrics_before = await self._collect_metrics(device)
+        try:
+            event_result = await self._get_event(event_id)
+            healing_action = event_result.get("suggested_action", "") if event_result else ""
 
-        await asyncio.sleep(0.15)
+            canary_result = await self._execute_healing_on_device(
+                canary_device, healing_action
+            )
 
-        success = random.random() > 0.05
-        metrics_after = await self._collect_metrics(device)
+            await asyncio.sleep(settings.grayscale_canary_observation_seconds)
 
-        if not success:
-            metrics_after.error_rate = metrics_after.error_rate + 0.1
+            device_healthy = await self._check_device_health(canary_device)
 
-        elapsed = (datetime.now(timezone.utc) - start_time).total_seconds() * 1000
-        return GrayscaleStepResult(
-            phase=GrayscalePhase.CANARY,
-            device=device,
-            success=success,
-            metrics_before=metrics_before,
-            metrics_after=metrics_after,
-            duration_ms=int(elapsed),
-            error=None if success else "命令执行失败",
-        )
+            async with async_session_maker() as session:
+                result = await session.execute(
+                    select(GrayscaleHealingTask).where(GrayscaleHealingTask.task_id == task_id)
+                )
+                task = result.scalar_one_or_none()
+                if task is None:
+                    raise ValueError(f"Task not found: {task_id}")
 
-    async def _rollback_devices(
-        self, devices: List[str], reason: RollbackReason
-    ) -> List[GrayscaleStepResult]:
-        """回滚设备"""
-        results = []
-        for device in devices:
-            await asyncio.sleep(0.1)
-            results.append(GrayscaleStepResult(
-                phase=GrayscalePhase.ROLLBACK,
-                device=device,
-                success=True,
-                duration_ms=100,
-            ))
-            self.logger.info(f"设备 {device} 已回滚 (原因: {reason.value})")
+                task.canary_completed_at = datetime.now(timezone.utc)
+                task.canary_result = canary_result
 
-        rollback_record = {
-            "timestamp": datetime.now(timezone.utc).isoformat(),
-            "reason": reason.value,
-            "devices_count": len(devices),
-            "devices": devices,
-        }
-        self._rollback_history.append(rollback_record)
-        return results
+                if device_healthy:
+                    task.canary_status = "success"
+                    task.overall_status = "canary_success"
+                    logger.info(f"Canary phase succeeded for task {task_id}")
+                else:
+                    task.canary_status = "failed"
+                    task.overall_status = "batch_failed"
+                    if settings.grayscale_auto_rollback:
+                        task.rollback_triggered = True
+                        task.rollback_reason = "Canary device unhealthy after healing"
+                        task.overall_status = "rolled_back"
+                        logger.warning(f"Canary phase failed for task {task_id}, auto-rollback triggered")
+                    else:
+                        logger.warning(f"Canary phase failed for task {task_id}")
 
-    async def _run_canary_phase(
-        self, devices: List[str], commands: List[str]
-    ) -> Dict[str, Any]:
-        """执行金丝雀阶段"""
-        canary_devices = self._select_canary_devices(devices)
-        self.logger.info(
-            f"金丝雀阶段: 选取 {len(canary_devices)}/{len(devices)} 台设备"
-        )
+                await session.commit()
 
-        canary_results = []
-        for device in canary_devices:
-            result = await self._execute_on_device(device, commands)
-            result.phase = GrayscalePhase.CANARY
-            canary_results.append(result)
+                try:
+                    from backend.core.websocket_manager import manager as ws_manager
+                    await ws_manager.broadcast({
+                        "type": "grayscale_progress",
+                        "data": {"task_id": task_id, "phase": "canary", "status": task.canary_status, "device": task.canary_device}
+                    })
+                except Exception as e:
+                    logger.warning(f"WebSocket broadcast failed: {e}")
 
-        all_success = all(r.success for r in canary_results)
-        metrics_ok = True
-        if all_success:
-            for r in canary_results:
-                if r.metrics_before and r.metrics_after:
-                    check = self._evaluate_canary(r.metrics_before, r.metrics_after)
-                    if check != CanaryCheckResult.PASSED:
-                        metrics_ok = False
+                return _serialize_task(task)
+
+        except Exception as e:
+            logger.error(f"Canary execution failed for task {task_id}: {e}", exc_info=True)
+            async with async_session_maker() as session:
+                result = await session.execute(
+                    select(GrayscaleHealingTask).where(GrayscaleHealingTask.task_id == task_id)
+                )
+                task = result.scalar_one_or_none()
+                if task:
+                    task.canary_status = "failed"
+                    task.canary_completed_at = datetime.now(timezone.utc)
+                    task.overall_status = "batch_failed"
+                    task.canary_result = {"error": str(e)}
+                    if settings.grayscale_auto_rollback:
+                        task.rollback_triggered = True
+                        task.rollback_reason = f"Canary execution error: {str(e)}"
+                        task.overall_status = "rolled_back"
+                    await session.commit()
+            raise
+
+    async def execute_batch(self, task_id: str) -> dict:
+        async with async_session_maker() as session:
+            result = await session.execute(
+                select(GrayscaleHealingTask).where(GrayscaleHealingTask.task_id == task_id)
+            )
+            task = result.scalar_one_or_none()
+            if task is None:
+                raise ValueError(f"Task not found: {task_id}")
+
+            if task.canary_status != "success":
+                raise ValueError(f"Cannot start batch: canary status is {task.canary_status}")
+
+            remaining_devices = [
+                d for d in task.target_devices
+                if d != task.canary_device and d not in (task.batch_completed_devices or [])
+            ]
+
+            task.batch_status = "running"
+            task.overall_status = "batch_running"
+            task.batch_started_at = datetime.now(timezone.utc)
+            await session.commit()
+
+            event_id = task.event_id
+            batch_completed_devices = list(task.batch_completed_devices or [])
+            batch_failed_devices = list(task.batch_failed_devices or [])
+            target_devices = list(task.target_devices or [])
+
+        event_result = await self._get_event(event_id)
+        healing_action = event_result.get("suggested_action", "") if event_result else ""
+
+        completed_devices = batch_completed_devices
+        failed_devices = batch_failed_devices
+        total_remaining = len(remaining_devices)
+        processed = 0
+
+        try:
+            batch_size = settings.grayscale_batch_size
+            for i in range(0, total_remaining, batch_size):
+                batch = remaining_devices[i:i + batch_size]
+
+                for device_id in batch:
+                    try:
+                        await self._execute_healing_on_device(device_id, healing_action)
+                        completed_devices.append(device_id)
+                    except Exception as e:
+                        logger.error(f"Failed to heal device {device_id}: {e}")
+                        failed_devices.append(device_id)
+
+                processed += len(batch)
+
+                async with async_session_maker() as session:
+                    result = await session.execute(
+                        select(GrayscaleHealingTask).where(GrayscaleHealingTask.task_id == task_id)
+                    )
+                    task = result.scalar_one_or_none()
+                    if task is None:
                         break
 
-        passed = all_success and metrics_ok
-        return {
-            "phase": GrayscalePhase.CANARY.value,
-            "canary_devices": canary_devices,
-            "passed": passed,
-            "results": [
-                {
-                    "device": r.device,
-                    "success": r.success,
-                    "duration_ms": r.duration_ms,
-                    "error": r.error,
-                }
-                for r in canary_results
-            ],
-        }
+                    task.batch_completed_devices = completed_devices
+                    task.batch_failed_devices = failed_devices
+                    task.batch_progress = int((processed / len(target_devices)) * 100)
+                    await session.commit()
 
-    async def _run_batch_phase(
-        self,
-        all_devices: List[str],
-        canary_devices: List[str],
-        commands: List[str],
-    ) -> Dict[str, Any]:
-        """执行批量阶段"""
-        remaining = [d for d in all_devices if d not in canary_devices]
-        batch_index = 0
-        all_batch_results = []
-        completed_devices = []
-
-        while remaining:
-            batch = self._select_batch_devices(
-                all_devices, canary_devices, batch_index
-            )
-            if not batch:
-                break
-
-            self.logger.info(
-                f"批量阶段 (批次 {batch_index + 1}): "
-                f"执行 {len(batch)} 台设备"
-            )
-
-            coros = [self._execute_on_device(dev, commands) for dev in batch]
-            batch_results = await asyncio.gather(*coros, return_exceptions=True)
-
-            batch_failed = False
-            for dev, result in zip(batch, batch_results):
-                if isinstance(result, Exception):
-                    all_batch_results.append({
-                        "device": dev,
-                        "success": False,
-                        "error": str(result),
+                try:
+                    from backend.core.websocket_manager import manager as ws_manager
+                    await ws_manager.broadcast({
+                        "type": "grayscale_progress",
+                        "data": {"task_id": task_id, "phase": "batch", "status": "running", "progress": task.batch_progress}
                     })
-                    batch_failed = True
-                else:
-                    all_batch_results.append({
-                        "device": dev,
-                        "success": result.success,
-                        "duration_ms": result.duration_ms,
-                        "error": result.error,
-                    })
-                    if result.success:
-                        completed_devices.append(dev)
-                    else:
-                        batch_failed = True
+                except Exception as e:
+                    logger.warning(f"WebSocket broadcast failed: {e}")
 
-            if batch_failed and self.config.auto_rollback_enabled:
-                self.logger.warning("批量阶段检测到失败，触发自动回滚")
-                rollback_results = await self._rollback_devices(
-                    canary_devices + completed_devices,
-                    RollbackReason.METRICS_DEGRADED,
+                critical_failure = len(failed_devices) > len(target_devices) * 0.5
+                if critical_failure and settings.grayscale_auto_rollback:
+                    return await self.rollback_task(task_id, "Critical batch failure: too many devices failed")
+
+                if i + batch_size < total_remaining:
+                    await asyncio.sleep(settings.grayscale_batch_observation_seconds)
+
+            async with async_session_maker() as session:
+                result = await session.execute(
+                    select(GrayscaleHealingTask).where(GrayscaleHealingTask.task_id == task_id)
                 )
-                return {
-                    "phase": GrayscalePhase.BATCH.value,
-                    "status": "rolled_back",
-                    "batch_results": all_batch_results,
-                    "rollback_results": [
-                        {"device": r.device, "success": r.success}
-                        for r in rollback_results
-                    ],
-                }
+                task = result.scalar_one_or_none()
+                if task is None:
+                    raise ValueError(f"Task not found: {task_id}")
 
-            remaining = [d for d in remaining if d not in batch]
-            batch_index += 1
+                task.batch_completed_at = datetime.now(timezone.utc)
+                task.batch_progress = 100
 
-            if self.config.observation_period_seconds > 0:
-                self.logger.info(
-                    f"观察期: 等待 {self.config.observation_period_seconds}s"
-                )
-                await asyncio.sleep(min(1.0, self.config.observation_period_seconds * 0.01))
-
-        return {
-            "phase": GrayscalePhase.BATCH.value,
-            "status": "completed",
-            "batch_results": all_batch_results,
-        }
-
-    async def process(self, input_data: Dict[str, Any]) -> Dict[str, Any]:
-        """执行灰度自愈流程
-
-        输入:
-            event_id: 自愈事件ID
-            devices: 目标设备列表
-            commands: 执行命令列表
-            skip_canary: 是否跳过金丝雀阶段
-        """
-        event_id = input_data.get("event_id")
-        devices = input_data.get("devices", [])
-        commands = input_data.get("commands", [])
-        skip_canary = input_data.get("skip_canary", False)
-
-        if not devices or not commands:
-            return {
-                "status": "failed",
-                "error": "缺少设备列表或执行命令",
-                "phase": None,
-            }
-
-        task_id = f"gs-{datetime.now(timezone.utc).strftime('%Y%m%d%H%M%S')}"
-        self._active_tasks[task_id] = {
-            "event_id": event_id,
-            "devices": devices,
-            "started_at": datetime.now(timezone.utc).isoformat(),
-            "status": GrayscaleTaskStatus.RUNNING.value,
-        }
-
-        self.logger.info(
-            f"灰度自愈任务 {task_id} 启动: "
-            f"设备数={len(devices)}, 命令数={len(commands)}"
-        )
-
-        canary_devices = []
-
-        # ── 金丝雀阶段 ──
-        if not skip_canary:
-            canary_result = await self._run_canary_phase(devices, commands)
-            canary_devices = canary_result.get("canary_devices", [])
-
-            if not canary_result["passed"]:
-                if self.config.auto_rollback_enabled:
-                    rollback_results = await self._rollback_devices(
-                        canary_devices, RollbackReason.CANARY_FAILED
-                    )
-                    self._active_tasks[task_id]["status"] = (
-                        GrayscaleTaskStatus.ROLLED_BACK.value
-                    )
-                    return {
-                        "task_id": task_id,
-                        "status": "rolled_back",
-                        "reason": "canary_failed",
-                        "canary_result": canary_result,
-                        "rollback_results": [
-                            {"device": r.device, "success": r.success}
-                            for r in rollback_results
-                        ],
-                    }
+                if failed_devices:
+                    task.batch_status = "failed"
+                    task.overall_status = "batch_failed"
                 else:
-                    self._active_tasks[task_id]["status"] = (
-                        GrayscaleTaskStatus.FAILED.value
-                    )
-                    return {
-                        "task_id": task_id,
-                        "status": "failed",
-                        "reason": "canary_failed_no_rollback",
-                        "canary_result": canary_result,
-                    }
+                    task.batch_status = "success"
+                    task.overall_status = "batch_success"
+
+                await session.commit()
+                return _serialize_task(task)
+
+        except Exception as e:
+            logger.error(f"Batch execution failed for task {task_id}: {e}", exc_info=True)
+            async with async_session_maker() as session:
+                result = await session.execute(
+                    select(GrayscaleHealingTask).where(GrayscaleHealingTask.task_id == task_id)
+                )
+                task = result.scalar_one_or_none()
+                if task:
+                    task.batch_status = "failed"
+                    task.batch_completed_at = datetime.now(timezone.utc)
+                    task.overall_status = "batch_failed"
+                    await session.commit()
+            raise
+
+    async def rollback_task(self, task_id: str, reason: str) -> dict:
+        async with async_session_maker() as session:
+            result = await session.execute(
+                select(GrayscaleHealingTask).where(GrayscaleHealingTask.task_id == task_id)
+            )
+            task = result.scalar_one_or_none()
+            if task is None:
+                raise ValueError(f"Task not found: {task_id}")
+
+            task.rollback_triggered = True
+            task.rollback_reason = reason
+            task.overall_status = "rolled_back"
+            await session.commit()
+
+            try:
+                from backend.core.websocket_manager import manager as ws_manager
+                await ws_manager.broadcast({
+                    "type": "grayscale_progress",
+                    "data": {"task_id": task_id, "phase": "rollback", "status": "rolled_back", "reason": reason}
+                })
+            except Exception as e:
+                logger.warning(f"WebSocket broadcast failed: {e}")
+
+            batch_completed_devices = list(task.batch_completed_devices or [])
+            canary_status = task.canary_status
+            canary_device = task.canary_device
+
+        all_healed = batch_completed_devices
+        if canary_status == "success":
+            all_healed.append(canary_device)
+
+        rollback_results = {}
+        for device_id in all_healed:
+            try:
+                rollback_result = await self._execute_rollback_on_device(device_id)
+                rollback_results[device_id] = rollback_result
+            except Exception as e:
+                logger.error(f"Rollback failed for device {device_id}: {e}")
+                rollback_results[device_id] = {"status": "failed", "error": str(e)}
+
+        await self.analyze_root_cause(task_id)
+
+        async with async_session_maker() as session:
+            result = await session.execute(
+                select(GrayscaleHealingTask).where(GrayscaleHealingTask.task_id == task_id)
+            )
+            task = result.scalar_one_or_none()
+            return _serialize_task(task) if task else {}
+
+    async def analyze_root_cause(self, task_id: str) -> dict:
+        async with async_session_maker() as session:
+            result = await session.execute(
+                select(GrayscaleHealingTask).where(GrayscaleHealingTask.task_id == task_id)
+            )
+            task = result.scalar_one_or_none()
+            if task is None:
+                raise ValueError(f"Task not found: {task_id}")
+
+            event_id = task.event_id
+            canary_device = task.canary_device
+            canary_status = task.canary_status
+            canary_result = task.canary_result
+            batch_failed_devices = task.batch_failed_devices
+            rollback_reason = task.rollback_reason
+
+        event_result = await self._get_event(event_id)
+        healing_action = event_result.get("suggested_action", "") if event_result else ""
+        event_description = event_result.get("description", "") if event_result else ""
+
+        metrics_before = await self._collect_device_metrics(canary_device)
+        metrics_after = await self._collect_device_metrics(canary_device)
+
+        prompt = f"""你是智维AgentHub的根因分析引擎，负责分析灰度自愈失败的根本原因。
+
+## 自愈事件信息:
+- 事件描述: {event_description}
+- 自愈动作: {healing_action}
+- 金丝雀设备: {canary_device}
+- 金丝雀状态: {canary_status}
+- 金丝雀结果: {json.dumps(canary_result or {}, ensure_ascii=False)}
+- 批次失败设备: {json.dumps(batch_failed_devices or [], ensure_ascii=False)}
+- 回滚原因: {rollback_reason or 'N/A'}
+
+## 设备指标(自愈前):
+{json.dumps(metrics_before, ensure_ascii=False, indent=2)}
+
+## 设备指标(自愈后):
+{json.dumps(metrics_after, ensure_ascii=False, indent=2)}
+
+## 任务:
+1. 分析自愈失败的根本原因
+2. 识别可能的副作用
+3. 提供改进建议
+
+## 输出格式（纯JSON，不要markdown代码块）:
+{{
+  "root_cause": "根本原因描述",
+  "contributing_factors": ["因素1", "因素2"],
+  "side_effects": ["副作用1", "副作用2"],
+  "recommendation": "改进建议",
+  "confidence": 0.0
+}}
+
+请只输出JSON，不要其他文字。"""
+
+        rca_text = ""
+        try:
+            from backend.agents.llm_gateway import get_llm_gateway, TaskType
+            gateway = get_llm_gateway()
+            llm_result = await gateway.chat(
+                messages=[
+                    {"role": "system", "content": "你是网络运维根因分析专家，擅长分析自愈失败原因。"},
+                    {"role": "user", "content": prompt},
+                ],
+                task_type=TaskType.FAULT_DIAGNOSE,
+                temperature=0.3,
+                max_tokens=1024,
+            )
+            rca_text = llm_result.get("content", "")
+        except Exception as e:
+            logger.error(f"LLM root cause analysis failed: {e}")
+            rca_text = json.dumps({
+                "root_cause": f"LLM分析不可用，手动分析: {rollback_reason or 'unknown'}",
+                "contributing_factors": [],
+                "side_effects": [],
+                "recommendation": "请手动检查设备状态和自愈动作",
+                "confidence": 0.0,
+            })
+
+        parsed_rca = {}
+        try:
+            json_str = rca_text.strip()
+            if json_str.startswith("```"):
+                json_str = json_str.split("\n", 1)[1] if "\n" in json_str else json_str[3:]
+                json_str = json_str.rsplit("```", 1)[0]
+            parsed_rca = json.loads(json_str.strip())
+        except json.JSONDecodeError:
+            parsed_rca = {"root_cause": rca_text, "raw_response": True}
+
+        async with async_session_maker() as session:
+            evaluation_id = _generate_id("eval")
+            evaluation = HealingEvaluation(
+                evaluation_id=evaluation_id,
+                event_id=event_id,
+                task_id=task_id,
+                metrics_before=metrics_before,
+                metrics_after=metrics_after,
+                healing_action=healing_action,
+                root_cause_analysis=parsed_rca.get("root_cause", ""),
+                side_effects=parsed_rca.get("side_effects", []),
+                recommendation=parsed_rca.get("recommendation", ""),
+                evaluated_at=datetime.now(timezone.utc),
+            )
+            session.add(evaluation)
+            await session.commit()
+            await session.refresh(evaluation)
+            logger.info(f"Root cause analysis completed for task {task_id}, evaluation {evaluation_id}")
+            return _serialize_evaluation(evaluation)
+
+    async def evaluate_healing(self, event_id: int, task_id: Optional[str] = None) -> dict:
+        async with async_session_maker() as session:
+            query = select(HealingEvaluation).where(HealingEvaluation.event_id == event_id)
+            if task_id:
+                query = query.where(HealingEvaluation.task_id == task_id)
+            query = query.order_by(HealingEvaluation.created_at.desc())
+            result = await session.execute(query)
+            existing = result.scalar_one_or_none()
+
+            if existing and existing.metrics_after is not None:
+                return _serialize_evaluation(existing)
+
+        event_result = await self._get_event(event_id)
+        healing_action = event_result.get("suggested_action", "") if event_result else ""
+
+        target_device = event_result.get("target_device", "") if event_result else ""
+        metrics_before = await self._collect_device_metrics(target_device)
+        metrics_after = await self._collect_device_metrics(target_device)
+
+        effectiveness_score = self._calculate_effectiveness(metrics_before, metrics_after)
+        side_effects = self._detect_side_effects(metrics_before, metrics_after)
+
+        recommendation = ""
+        if effectiveness_score >= 0.8:
+            recommendation = "自愈效果良好，建议保持当前策略"
+        elif effectiveness_score >= 0.5:
+            recommendation = "自愈效果一般，建议优化自愈动作参数"
         else:
-            canary_devices = devices[:1]
-            canary_result = {"phase": "canary", "passed": True, "skipped": True}
+            recommendation = "自愈效果不佳，建议重新评估自愈策略或手动介入"
 
-        # ── 批量阶段 ──
-        batch_result = await self._run_batch_phase(
-            devices, canary_devices, commands
-        )
+        async with async_session_maker() as session:
+            evaluation_id = _generate_id("eval")
+            evaluation = HealingEvaluation(
+                evaluation_id=evaluation_id,
+                event_id=event_id,
+                task_id=task_id,
+                metrics_before=metrics_before,
+                metrics_after=metrics_after,
+                healing_action=healing_action,
+                effectiveness_score=effectiveness_score,
+                side_effects=side_effects,
+                recommendation=recommendation,
+                evaluated_at=datetime.now(timezone.utc),
+            )
+            session.add(evaluation)
+            await session.commit()
+            await session.refresh(evaluation)
+            logger.info(f"Healing evaluation completed for event {event_id}, score={effectiveness_score}")
+            return _serialize_evaluation(evaluation)
 
-        final_status = batch_result.get("status", "completed")
-        self._active_tasks[task_id]["status"] = (
-            GrayscaleTaskStatus.ROLLED_BACK.value
-            if final_status == "rolled_back"
-            else GrayscaleTaskStatus.COMPLETED.value
-        )
+    def _calculate_effectiveness(self, metrics_before: dict, metrics_after: dict) -> float:
+        if not metrics_before or not metrics_after:
+            return 0.0
 
+        cpu_before = metrics_before.get("cpu_usage", 0)
+        cpu_after = metrics_after.get("cpu_usage", 0)
+        mem_before = metrics_before.get("memory_usage", 0)
+        mem_after = metrics_after.get("memory_usage", 0)
+
+        cpu_improved = max(0, cpu_before - cpu_after) / max(cpu_before, 1)
+        mem_improved = max(0, mem_before - mem_after) / max(mem_before, 1)
+
+        status_before = metrics_before.get("status", "unhealthy")
+        status_after = metrics_after.get("status", "unhealthy")
+        status_score = 1.0 if status_after == "healthy" and status_before != "healthy" else 0.0
+
+        score = (cpu_improved * 0.3 + mem_improved * 0.3 + status_score * 0.4)
+        return round(min(max(score, 0.0), 1.0), 2)
+
+    def _detect_side_effects(self, metrics_before: dict, metrics_after: dict) -> list:
+        side_effects = []
+        if not metrics_before or not metrics_after:
+            return side_effects
+
+        if metrics_after.get("cpu_usage", 0) > metrics_before.get("cpu_usage", 0) + 20:
+            side_effects.append("CPU使用率异常升高")
+        if metrics_after.get("memory_usage", 0) > metrics_before.get("memory_usage", 0) + 20:
+            side_effects.append("内存使用率异常升高")
+        if metrics_before.get("status") == "healthy" and metrics_after.get("status") != "healthy":
+            side_effects.append("设备状态从健康变为异常")
+
+        return side_effects
+
+    async def get_task(self, task_id: str) -> Optional[dict]:
+        async with async_session_maker() as session:
+            result = await session.execute(
+                select(GrayscaleHealingTask).where(GrayscaleHealingTask.task_id == task_id)
+            )
+            task = result.scalar_one_or_none()
+            if task is None:
+                return None
+            return _serialize_task(task)
+
+    async def list_tasks(
+        self,
+        status: Optional[str] = None,
+        limit: int = 20,
+        offset: int = 0,
+    ) -> List[dict]:
+        async with async_session_maker() as session:
+            query = select(GrayscaleHealingTask)
+            if status is not None:
+                query = query.where(GrayscaleHealingTask.overall_status == status)
+            query = query.order_by(GrayscaleHealingTask.created_at.desc()).offset(offset).limit(limit)
+            result = await session.execute(query)
+            tasks = result.scalars().all()
+            return [_serialize_task(t) for t in tasks]
+
+    async def list_evaluations(
+        self,
+        event_id: Optional[int] = None,
+        task_id: Optional[str] = None,
+        limit: int = 20,
+        offset: int = 0,
+    ) -> List[dict]:
+        async with async_session_maker() as session:
+            query = select(HealingEvaluation)
+            if event_id is not None:
+                query = query.where(HealingEvaluation.event_id == event_id)
+            if task_id is not None:
+                query = query.where(HealingEvaluation.task_id == task_id)
+            query = query.order_by(HealingEvaluation.created_at.desc()).offset(offset).limit(limit)
+            result = await session.execute(query)
+            evaluations = result.scalars().all()
+            return [_serialize_evaluation(ev) for ev in evaluations]
+
+    async def _get_event(self, event_id: int) -> Optional[dict]:
+        try:
+            async with async_session_maker() as session:
+                result = await session.execute(
+                    select(SelfHealingEvent).where(SelfHealingEvent.id == event_id)
+                )
+                event = result.scalar_one_or_none()
+                if event is None:
+                    return None
+                return {
+                    "id": event.id,
+                    "event_type": event.event_type,
+                    "severity": event.severity,
+                    "description": event.description,
+                    "suggested_action": event.suggested_action,
+                    "target_device": event.target_device,
+                    "status": event.status,
+                }
+        except Exception as e:
+            logger.error(f"Failed to get event {event_id}: {e}")
+            return None
+
+    async def _execute_healing_on_device(self, device_id: str, healing_action: str) -> dict:
+        logger.info(f"Executing healing on device {device_id}: {healing_action}")
         return {
-            "task_id": task_id,
-            "status": final_status,
-            "canary_percentage": self.config.canary_percentage,
-            "batch_size": self.config.batch_size,
-            "auto_rollback": self.config.auto_rollback_enabled,
-            "canary_result": canary_result,
-            "batch_result": batch_result,
+            "device_id": device_id,
+            "action": healing_action,
+            "status": "executed",
+            "timestamp": datetime.now(timezone.utc).isoformat(),
         }
 
-    async def health_check(self) -> Dict[str, Any]:
-        """健康检查"""
-        active_count = sum(
-            1 for t in self._active_tasks.values()
-            if t["status"] == GrayscaleTaskStatus.RUNNING.value
-        )
+    async def _check_device_health(self, device_id: str) -> bool:
+        try:
+            async with async_session_maker() as session:
+                from backend.database.models import Device
+                result = await session.execute(
+                    select(Device).where(Device.device_id == device_id)
+                )
+                device = result.scalar_one_or_none()
+                if device and device.status == "healthy":
+                    return True
+        except Exception as e:
+            logger.error(f"Device health check failed for {device_id}: {e}")
+            return False
+        return False
+
+    async def _execute_rollback_on_device(self, device_id: str) -> dict:
+        logger.info(f"Executing rollback on device {device_id}")
         return {
-            "status": "healthy",
-            "agent": self.__class__.__name__,
-            "config": {
-                "canary_percentage": self.config.canary_percentage,
-                "batch_size": self.config.batch_size,
-                "observation_period_seconds": self.config.observation_period_seconds,
-                "auto_rollback_enabled": self.config.auto_rollback_enabled,
-            },
-            "active_tasks": active_count,
-            "total_tasks": len(self._active_tasks),
-            "rollback_history_count": len(self._rollback_history),
+            "device_id": device_id,
+            "status": "rolled_back",
+            "timestamp": datetime.now(timezone.utc).isoformat(),
         }
+
+    async def _collect_device_metrics(self, device_id: str) -> dict:
+        try:
+            async with async_session_maker() as session:
+                from backend.database.models import Device
+                result = await session.execute(
+                    select(Device).where(Device.device_id == device_id)
+                )
+                device = result.scalar_one_or_none()
+                if device:
+                    return {
+                        "device_id": device_id,
+                        "status": device.status,
+                        "cpu_usage": device.cpu_usage,
+                        "memory_usage": device.memory_usage,
+                    }
+        except Exception as e:
+            logger.warning(f"Failed to collect metrics for {device_id}: {e}")
+            return {"cpu_usage": 0, "memory_usage": 0, "interface_errors": 0, "link_utilization": 0}
+        return {"device_id": device_id, "status": "unknown", "cpu_usage": 0, "memory_usage": 0}
+
+
+_grayscale_healing_engine: Optional[GrayscaleHealingEngine] = None
+
+
+def get_grayscale_healing_engine() -> GrayscaleHealingEngine:
+    global _grayscale_healing_engine
+    if _grayscale_healing_engine is None:
+        _grayscale_healing_engine = GrayscaleHealingEngine()
+    return _grayscale_healing_engine

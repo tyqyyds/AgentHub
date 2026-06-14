@@ -1,153 +1,157 @@
 version: '3.8'
 
 services:
-  postgresql:
+  postgres:
     image: postgres:15-alpine
-    container_name: netops-postgres
+    container_name: agenthub-postgres
     environment:
-      POSTGRES_DB: netops_db
-      POSTGRES_USER: netops_user
-      POSTGRES_PASSWORD: netops_password
-    ports:
-      - "5432:5432"
+      POSTGRES_DB: ${POSTGRES_DB:-agenthub}
+      POSTGRES_USER: ${POSTGRES_USER:-agenthub_app}
+      POSTGRES_PASSWORD: ${POSTGRES_PASSWORD:?POSTGRES_PASSWORD must be set}
     volumes:
       - postgres_data:/var/lib/postgresql/data
     healthcheck:
-      test: ["CMD-SHELL", "pg_isready -U netops_user -d netops_db"]
+      test: ["CMD-SHELL", "pg_isready -U ${POSTGRES_USER:-agenthub_app} -d ${POSTGRES_DB:-agenthub}"]
       interval: 30s
       timeout: 10s
       retries: 3
-
-  influxdb:
-    image: influxdb:2.7-alpine
-    container_name: netops-influxdb
-    environment:
-      DOCKER_INFLUXDB_INIT_MODE: setup
-      DOCKER_INFLUXDB_INIT_USERNAME: netops_user
-      DOCKER_INFLUXDB_INIT_PASSWORD: netops_password
-      DOCKER_INFLUXDB_INIT_ORG: netops
-      DOCKER_INFLUXDB_INIT_BUCKET: telemetry
-      DOCKER_INFLUXDB_INIT_ADMIN_TOKEN: netops_admin_token
-    ports:
-      - "8086:8086"
-    volumes:
-      - influxdb_data:/var/lib/influxdb2
-    healthcheck:
-      test: ["CMD-SHELL", "curl -f http://localhost:8086/health || exit 1"]
-      interval: 30s
-      timeout: 10s
-      retries: 3
+    networks:
+      - agenthub-net
 
   redis:
     image: redis:7-alpine
-    container_name: netops-redis
-    ports:
-      - "6379:6379"
+    container_name: agenthub-redis
+    command: redis-server --requirepass ${REDIS_PASSWORD:?REDIS_PASSWORD must be set} --appendonly yes
     volumes:
       - redis_data:/data
     healthcheck:
-      test: ["CMD", "redis-cli", "ping"]
+      test: ["CMD", "redis-cli", "-a", "${REDIS_PASSWORD}", "ping"]
       interval: 30s
       timeout: 10s
       retries: 3
+    networks:
+      - agenthub-net
 
   orchestrator:
-    build: ./backend
-    container_name: netops-orchestrator
-    command: uvicorn backend.api.main:app --host 0.0.0.0 --port 8000
+    build: 
+      context: .
+      dockerfile: Dockerfile.orchestrator
+    container_name: agenthub-orchestrator
+    environment:
+      - DATABASE_URL=postgresql://${POSTGRES_USER:-agenthub_app}:${POSTGRES_PASSWORD}@postgres:5432/${POSTGRES_DB:-agenthub}
+      - REDIS_URL=redis://:${REDIS_PASSWORD}@redis:6379/0
+      - ENV=${ENVIRONMENT:-production}
+      - ZHIPU_API_KEY=${ZHIPU_API_KEY:-}
+      - DEEPSEEK_API_KEY=${DEEPSEEK_API_KEY:-}
+      - SECRET_KEY=${SECRET_KEY:?SECRET_KEY must be set}
+      - OTEL_EXPORTER_OTLP_ENDPOINT=http://jaeger:4317
+      - OTEL_SERVICE_NAME=agenthub-orchestrator
+      - OTEL_ENABLED=true
     depends_on:
-      postgresql:
+      postgres:
         condition: service_healthy
       redis:
         condition: service_healthy
-    environment:
-      DATABASE_URL: postgresql+asyncpg://netops_user:netops_password@postgresql:5432/netops_db
-      REDIS_URL: redis://redis:6379/0
-      SECRET_KEY: ${SECRET_KEY:-change-me-in-production}
-      DEEPSEEK_API_KEY: ${DEEPSEEK_API_KEY:-}
-      ZHIPU_API_KEY: ${ZHIPU_API_KEY:-}
     ports:
       - "8000:8000"
-    healthcheck:
-      test: ["CMD-SHELL", "curl -f http://localhost:8000/api/v1/health || exit 1"]
-      interval: 30s
-      timeout: 10s
-      retries: 3
+    volumes:
+      - ./backend:/app/backend
+    networks:
+      - agenthub-net
 
-  agent-worker:
-    build: ./backend
-    container_name: netops-agent-worker
-    command: python -m backend.agents.worker
-    depends_on:
-      orchestrator:
-        condition: service_healthy
-      redis:
-        condition: service_healthy
+  agent-worker-1:
+    build: 
+      context: .
+      dockerfile: Dockerfile.agent-worker
+    container_name: agenthub-worker-1
     environment:
-      DATABASE_URL: postgresql+asyncpg://netops_user:netops_password@postgresql:5432/netops_db
-      REDIS_URL: redis://redis:6379/0
-      SECRET_KEY: ${SECRET_KEY:-change-me-in-production}
-      DEEPSEEK_API_KEY: ${DEEPSEEK_API_KEY:-}
-      ZHIPU_API_KEY: ${ZHIPU_API_KEY:-}
-      WORKER_ID: worker-1
-    deploy:
-      replicas: 2
+      - ORCHESTRATOR_URL=http://orchestrator:8000
+      - REDIS_URL=redis://:${REDIS_PASSWORD}@redis:6379/0
+      - AGENT_ID=worker-1
+    depends_on:
+      - orchestrator
+      - redis
+    networks:
+      - agenthub-net
+
+  agent-worker-2:
+    build: 
+      context: .
+      dockerfile: Dockerfile.agent-worker
+    container_name: agenthub-worker-2
+    environment:
+      - ORCHESTRATOR_URL=http://orchestrator:8000
+      - REDIS_URL=redis://:${REDIS_PASSWORD}@redis:6379/0
+      - AGENT_ID=worker-2
+    depends_on:
+      - orchestrator
+      - redis
+    networks:
+      - agenthub-net
 
   mcp-registry:
-    build: ./backend
-    container_name: netops-mcp-registry
-    command: python -m backend.agents.mcp_registry_server
-    depends_on:
-      redis:
-        condition: service_healthy
+    build: 
+      context: .
+      dockerfile: Dockerfile.mcp-registry
+    container_name: agenthub-mcp-registry
     environment:
-      REDIS_URL: redis://redis:6379/0
-    ports:
-      - "8001:8001"
+      - REDIS_URL=redis://:${REDIS_PASSWORD}@redis:6379/0
+    depends_on:
+      - redis
+    networks:
+      - agenthub-net
 
   a2a-gateway:
-    build: ./backend
-    container_name: netops-a2a-gateway
-    command: python -m backend.agents.a2a_gateway_server
-    depends_on:
-      redis:
-        condition: service_healthy
+    build: 
+      context: .
+      dockerfile: Dockerfile.a2a-gateway
+    container_name: agenthub-a2a-gateway
     environment:
-      REDIS_URL: redis://redis:6379/0
+      - REDIS_URL=redis://:${REDIS_PASSWORD}@redis:6379/0
+      - ORCHESTRATOR_URL=http://orchestrator:8000
+    depends_on:
+      - orchestrator
+      - redis
     ports:
-      - "8002:8002"
+      - "8080:8080"
+    networks:
+      - agenthub-net
 
   frontend:
-    build: ./frontend
-    container_name: netops-frontend
+    build: 
+      context: ./frontend
+      dockerfile: Dockerfile
+    container_name: agenthub-frontend
+    environment:
+      - VITE_API_BASE_URL=http://localhost:8000
     depends_on:
-      orchestrator:
-        condition: service_healthy
+      - orchestrator
     ports:
-      - "80:80"
+      - "5173:5173"
+    networks:
+      - agenthub-net
 
   jaeger:
-    image: jaegertracing/all-in-one:latest
-    container_name: netops-jaeger
+    image: jaegertracing/all-in-one:1.54
+    container_name: agenthub-jaeger
     environment:
-      COLLECTOR_OTLP_ENABLED: true
-    ports:
-      - "16686:16686"
-      - "4317:4317"
-      - "4318:4318"
+      - COLLECTOR_OTLP_ENABLED=true
+    networks:
+      - agenthub-net
 
   chromadb:
     image: chromadb/chroma:latest
-    container_name: netops-chromadb
-    ports:
-      - "8003:8000"
+    container_name: agenthub-chromadb
     volumes:
-      - chromadb_data:/chroma/chroma
-    environment:
-      ANONYMIZED_TELEMETRY: FALSE
+      - chroma_data:/chroma/chroma
+    networks:
+      - agenthub-net
 
 volumes:
   postgres_data:
-  influxdb_data:
   redis_data:
-  chromadb_data:
+  chroma_data:
+
+networks:
+  agenthub-net:
+    driver: bridge

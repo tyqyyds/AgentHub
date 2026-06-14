@@ -1,110 +1,111 @@
-import { ref, onMounted, onUnmounted } from 'vue'
-import { api } from '@/utils/apiClient'
-import { useWebSocket } from './useWebSocket'
+import { useRouter } from 'vue-router'
+import { useAssistantStore, type WorkflowStep } from '@/stores/assistant'
 
-type AgentStatus = 'idle' | 'busy' | 'error' | 'offline'
-type CollaborationMode = 'supervisor' | 'parallel' | 'debate'
-
-interface AgentInfo {
-  id: string
-  name: string
-  type: string
-  status: AgentStatus
-  capabilities?: string[]
-  last_active?: string
+interface AgenticAction {
+  type: 'navigate' | 'highlight' | 'execute' | 'query' | 'render_chart' | 'confirm_approval' | 'frontend_action'
+  action?: string
+  params: Record<string, any>
+  label?: string
 }
 
-interface CollaborationConfig {
-  mode: CollaborationMode
-  agents: string[]
-  task: string
-  context?: Record<string, unknown>
+interface ReActStepUI {
+  stepNumber: number
+  thought: string
+  action: string | null
+  actionInput: Record<string, any> | null
+  observation: string | null
+  status: 'thinking' | 'acting' | 'observing' | 'completed' | 'failed' | 'waiting_approval'
 }
 
-interface CollaborationResult {
-  id: string
-  status: string
-  result?: unknown
+const reactStatusMap: Record<ReActStepUI['status'], WorkflowStep['status']> = {
+  thinking: 'running',
+  acting: 'running',
+  observing: 'running',
+  completed: 'completed',
+  failed: 'failed',
+  waiting_approval: 'waiting_confirm'
 }
 
 export function useAgenticEngine() {
-  const agentStatuses = ref<Map<string, AgentInfo>>(new Map())
-  const collaborationMode = ref<CollaborationMode>('supervisor')
-  const loading = ref(false)
-  const collaborating = ref(false)
+  const router = useRouter()
+  const store = useAssistantStore()
 
-  const { lastMessage, connect: wsConnect, disconnect: wsDisconnect } = useWebSocket()
-
-  // 监听 WebSocket 消息中的 Agent 状态变更
-  let stopWatch: (() => void) | null = null
-
-  async function fetchAgentStatuses(): Promise<void> {
-    loading.value = true
-    try {
-      const data = await api.get<AgentInfo[]>('/api/v1/agents')
-      const map = new Map<string, AgentInfo>()
-      for (const agent of data) {
-        map.set(agent.id, agent)
-      }
-      agentStatuses.value = map
-    } finally {
-      loading.value = false
-    }
-  }
-
-  async function startCollaboration(config: CollaborationConfig): Promise<CollaborationResult | null> {
-    collaborating.value = true
-    collaborationMode.value = config.mode
-    try {
-      const data = await api.post<CollaborationResult>('/api/v1/agents/collaborate', config)
-      return data
-    } finally {
-      collaborating.value = false
-    }
-  }
-
-  function watchAgentEvents(): void {
-    wsConnect()
-
-    // 使用定时器轮询 lastMessage 变更
-    const interval = setInterval(() => {
-      if (lastMessage.value?.type === 'status_update') {
-        const agentData = lastMessage.value.data as AgentInfo
-        if (agentData?.id) {
-          const newMap = new Map(agentStatuses.value)
-          newMap.set(agentData.id, agentData)
-          agentStatuses.value = newMap
+  const executeAgenticAction = (action: AgenticAction) => {
+    switch (action.type) {
+      case 'navigate': {
+        const route = action.params.route
+        if (route) {
+          router.push(route)
         }
+        break
       }
-    }, 500)
-
-    stopWatch = () => clearInterval(interval)
-  }
-
-  function stopWatching(): void {
-    if (stopWatch) {
-      stopWatch()
-      stopWatch = null
+      case 'highlight': {
+        window.dispatchEvent(new CustomEvent('topology:highlight', { detail: { nodeId: action.params.node_id } }))
+        break
+      }
+      case 'execute': {
+        window.dispatchEvent(new CustomEvent('assistant:execute', { detail: action.params }))
+        break
+      }
+      case 'query': {
+        const query = action.params.query
+        if (query) {
+          store.sendMessage(query)
+        }
+        break
+      }
+      case 'render_chart': {
+        window.dispatchEvent(new CustomEvent('assistant:render_chart', { detail: action.params }))
+        break
+      }
+      case 'confirm_approval': {
+        store.pendingConfirmId = action.params.confirm_id || action.params.confirmId || null
+        store.openChat()
+        break
+      }
+      case 'frontend_action': {
+        if (action.action) {
+          window.dispatchEvent(new CustomEvent(action.action, { detail: action.params }))
+        }
+        break
+      }
     }
-    wsDisconnect()
   }
 
-  onMounted(() => {
-    fetchAgentStatuses()
-  })
+  const processReActSteps = (steps: ReActStepUI[]): WorkflowStep[] => {
+    return steps.map((step) => ({
+      id: `react_step_${step.stepNumber}`,
+      agent: step.action ? `Tool: ${step.action}` : 'Agent',
+      status: reactStatusMap[step.status],
+      title: step.thought,
+      detail: step.observation || undefined,
+      timestamp: new Date().toISOString()
+    }))
+  }
 
-  onUnmounted(() => {
-    stopWatching()
-  })
+  const handleReActResult = (result: any): string => {
+    if (result.frontend_actions && Array.isArray(result.frontend_actions)) {
+      for (const action of result.frontend_actions) {
+        executeAgenticAction(action as AgenticAction)
+      }
+    }
+
+    if (result.steps && Array.isArray(result.steps)) {
+      const workflow = processReActSteps(result.steps as ReActStepUI[])
+      store.setWorkflow(workflow)
+    }
+
+    if (result.requires_approval) {
+      store.pendingConfirmId = result.confirm_id || result.confirmId || `approval_${Date.now()}`
+      store.openChat()
+    }
+
+    return result.answer || result.content || result.final_answer || ''
+  }
 
   return {
-    agentStatuses,
-    collaborationMode,
-    loading,
-    collaborating,
-    fetchAgentStatuses,
-    startCollaboration,
-    watchAgentEvents,
-    stopWatching
+    executeAgenticAction,
+    processReActSteps,
+    handleReActResult
   }
 }

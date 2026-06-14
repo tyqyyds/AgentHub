@@ -1,0 +1,74 @@
+{
+  "dashboard": {
+    "status": "ERROR",
+    "detail": "HTTP Error 401: Unauthorized"
+  },
+  "intent": {
+    "status": "ERROR",
+    "detail": "HTTP Error 401: Unauthorized"
+  },
+  "topology": {
+    "status": "ERROR",
+    "detail": "HTTP Error 401: Unauthorized"
+  },
+  "self-healing": {
+    "status": "ERROR",
+    "detail": "HTTP Error 401: Unauthorized"
+  },
+  "mcp-tools": {
+    "status": "ERROR",
+    "detail": "HTTP Error 401: Unauthorized"
+  },
+  "agent-map": {
+    "status": "ERROR",
+    "detail": "HTTP Error 401: Unauthorized"
+  },
+  "audit-logs": {
+    "status": "ERROR",
+    "detail": "HTTP Error 401: Unauthorized"
+  },
+  "workflow": {
+    "status": "ERROR",
+    "detail": "HTTP Error 401: Unauthorized"
+  },
+  "playbooks": {
+    "status": "ERROR",
+    "detail": "HTTP Error 401: Unauthorized"
+  },
+  "webhooks": {
+    "status": "ERROR",
+    "detail": "HTTP Error 401: Unauthorized"
+  },
+  "users": {
+    "status": "PARTIAL",
+    "detail": "No dedicated users list API"
+  },
+  "knowledge": {
+    "status": "ERROR",
+    "detail": "HTTP Error 401: Unauthorized"
+  },
+  "llm-router": {
+    "status": "ERROR",
+    "detail": "HTTP Error 401: Unauthorized"
+  },
+  "scheduler": {
+    "status": "ERROR",
+    "detail": "HTTP Error 401: Unauthorized"
+  },
+  "sla": {
+    "status": "ERROR",
+    "detail": "HTTP Error 401: Unauthorized"
+  },
+  "observability": {
+    "status": "ERROR",
+    "detail": "HTTP Error 401: Unauthorized"
+  },
+  "failed-intents": {
+    "status": "ERROR",
+    "detail": "HTTP Error 401: Unauthorized"
+  },
+  "notifications": {
+    "status": "ERROR",
+    "detail": "HTTP Error 401: Unauthorized"
+  }
+}

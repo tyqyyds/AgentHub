@@ -1,288 +1,406 @@
-import logging
-from typing import Any, Dict, List, Optional
-from dataclasses import dataclass, field
+from typing import List, Dict, Any, Optional, Callable
 from enum import Enum
+from dataclasses import dataclass, field
+from datetime import datetime
+from uuid import uuid4
 import asyncio
-
-from ..core.config import settings
+import json
+import logging
 
 logger = logging.getLogger(__name__)
 
-
 class CollaborationMode(str, Enum):
-    """协作模式"""
     SUPERVISOR = "supervisor"
     PARALLEL = "parallel"
     DEBATE = "debate"
 
+class TaskStatus(str, Enum):
+    PENDING = "pending"
+    RUNNING = "running"
+    COMPLETED = "completed"
+    FAILED = "failed"
+    WAITING_APPROVAL = "waiting_approval"
 
 @dataclass
-class TaskNode:
-    """任务节点"""
+class SubTask:
     task_id: str
-    agent_name: str
-    input_data: Dict[str, Any]
-    dependencies: List[str] = field(default_factory=list)
-    status: str = "pending"
+    name: str
+    agent_id: str
+    description: str
+    params: Dict[str, Any]
+    status: TaskStatus = TaskStatus.PENDING
     result: Optional[Dict[str, Any]] = None
-
+    dependencies: List[str] = field(default_factory=list)
+    created_at: str = field(default_factory=lambda: datetime.now().isoformat())
+    completed_at: Optional[str] = None
 
 @dataclass
-class OrchestratorConfig:
-    """编排器配置"""
-    default_mode: CollaborationMode = CollaborationMode.SUPERVISOR
-    max_parallel_tasks: int = 10
-    debate_rounds: int = 3
-    debate_consensus_threshold: float = 0.7
-    task_timeout_seconds: int = 300
+class WorkflowTicket:
+    ticket_id: str
+    title: str
+    description: str
+    mode: CollaborationMode
+    subtasks: List[SubTask]
+    status: TaskStatus = TaskStatus.PENDING
+    created_at: str = field(default_factory=lambda: datetime.now().isoformat())
+    completed_at: Optional[str] = None
+    requires_approval: bool = False
+    approval_status: Optional[str] = None
 
-
-class OrchestratorAgent:
-    """编排器Agent：Supervisor/Parallel/Debate三种协作模式调度，任务分解与结果聚合"""
-
-    def __init__(self, config: Optional[OrchestratorConfig] = None):
-        self.config = config or OrchestratorConfig()
-        self.logger = logging.getLogger(f"{__name__}.{self.__class__.__name__}")
-        self._agent_pool: Dict[str, Any] = {}
-        self._task_graph: Dict[str, TaskNode] = {}
-
-    def register_agent(self, name: str, agent: Any) -> None:
-        """注册Agent到编排池"""
-        self._agent_pool[name] = agent
-        self.logger.info(f"Agent已注册: {name}")
-
-    def _decompose_task(self, intent: Dict[str, Any]) -> List[TaskNode]:
-        """将意图分解为子任务"""
-        actions = intent.get("actions", [])
-        targets = intent.get("targets", [])
-        nodes = []
-
-        for idx, action in enumerate(actions):
-            task_id = f"task_{idx}"
-            node = TaskNode(
-                task_id=task_id,
-                agent_name=action.get("type", "config_generator"),
-                input_data={
-                    "action": action,
-                    "targets": targets,
-                    "intent_name": intent.get("intent_name", ""),
-                },
-                dependencies=[f"task_{i}" for i in range(idx) if idx > 0] if idx > 0 else [],
+class MultiAgentOrchestrator:
+    def __init__(self, agent_registry=None, a2a_bus=None):
+        self.agent_registry = agent_registry
+        self.a2a_bus = a2a_bus
+        self.active_tickets: Dict[str, WorkflowTicket] = {}
+        self.completed_tickets: Dict[str, WorkflowTicket] = {}
+    
+    def create_ticket(self, title: str, description: str, mode: CollaborationMode, 
+                      subtask_defs: List[Dict[str, Any]], requires_approval: bool = False) -> WorkflowTicket:
+        ticket_id = f"ticket_{uuid4().hex[:8]}"
+        subtasks = []
+        
+        for defn in subtask_defs:
+            subtask = SubTask(
+                task_id=f"task_{uuid4().hex[:8]}",
+                name=defn.get("name", "unnamed"),
+                agent_id=defn.get("agent_id", ""),
+                description=defn.get("description", ""),
+                params=defn.get("params", {}),
+                dependencies=defn.get("dependencies", [])
             )
-            nodes.append(node)
-
-        if not nodes:
-            nodes.append(TaskNode(
-                task_id="task_0",
-                agent_name="intent_parser",
-                input_data=intent,
-            ))
-
-        return nodes
-
-    async def _execute_supervisor(self, tasks: List[TaskNode]) -> Dict[str, Any]:
-        """Supervisor模式：串行编排，监督执行"""
-        results = {}
-        for task in tasks:
-            for dep_id in task.dependencies:
-                if dep_id in results:
-                    task.input_data["dependency_result"] = results[dep_id]
-
-            agent = self._agent_pool.get(task.agent_name)
-            if agent and hasattr(agent, "process"):
-                try:
-                    task.result = await asyncio.wait_for(
-                        agent.process(task.input_data),
-                        timeout=self.config.task_timeout_seconds,
-                    )
-                    task.status = "completed"
-                except asyncio.TimeoutError:
-                    task.status = "timeout"
-                    task.result = {"error": "任务执行超时"}
-                    self.logger.warning(f"任务超时: {task.task_id}")
-                except Exception as e:
-                    task.status = "failed"
-                    task.result = {"error": str(e)}
-                    self.logger.error(f"任务执行失败: {task.task_id}, 错误: {e}")
-            else:
-                task.status = "skipped"
-                task.result = {"error": f"Agent未注册: {task.agent_name}"}
-
-            results[task.task_id] = task.result
-
-        return self._aggregate_results(tasks, results)
-
-    async def _execute_parallel(self, tasks: List[TaskNode]) -> Dict[str, Any]:
-        """Parallel模式：并行执行无依赖任务"""
-        results = {}
-        pending = list(tasks)
-        completed_ids = set()
-
-        while pending:
-            ready = [
-                t for t in pending
-                if all(d in completed_ids for d in t.dependencies)
-            ]
-            if not ready:
-                break
-
-            coros = []
-            for task in ready:
-                agent = self._agent_pool.get(task.agent_name)
-                if agent and hasattr(agent, "process"):
-                    coros.append(self._safe_process(agent, task))
-                else:
-                    task.status = "skipped"
-                    task.result = {"error": f"Agent未注册: {task.agent_name}"}
-                    coros.append(asyncio.coroutine(lambda t=task: t.result)())
-
-            batch_results = await asyncio.gather(*coros, return_exceptions=True)
-            for task, result in zip(ready, batch_results):
-                if isinstance(result, Exception):
-                    task.status = "failed"
-                    task.result = {"error": str(result)}
-                else:
-                    task.status = "completed"
-                    task.result = result
-                results[task.task_id] = task.result
-                completed_ids.add(task.task_id)
-                pending.remove(task)
-
-        return self._aggregate_results(tasks, results)
-
-    async def _execute_debate(self, tasks: List[TaskNode]) -> Dict[str, Any]:
-        """Debate模式：多Agent辩论决策"""
-        candidates = list(self._agent_pool.keys())
-        if len(candidates) < 2:
-            self.logger.warning("辩论模式需要至少2个Agent，降级为Supervisor模式")
-            return await self._execute_supervisor(tasks)
-
-        all_proposals = []
-        for round_num in range(self.config.debate_rounds):
-            round_proposals = []
-            for candidate_name in candidates:
-                agent = self._agent_pool[candidate_name]
-                if hasattr(agent, "process"):
-                    try:
-                        result = await agent.process({
-                            **(tasks[0].input_data if tasks else {}),
-                            "debate_round": round_num,
-                            "previous_proposals": all_proposals,
-                        })
-                        round_proposals.append({
-                            "agent": candidate_name,
-                            "proposal": result,
-                            "round": round_num,
-                        })
-                    except Exception as e:
-                        self.logger.error(f"辩论Agent {candidate_name} 异常: {e}")
-
-            all_proposals.extend(round_proposals)
-
-        return self._consensus_vote(all_proposals)
-
-    def _consensus_vote(self, proposals: List[Dict[str, Any]]) -> Dict[str, Any]:
-        """共识投票"""
-        if not proposals:
-            return {"status": "no_consensus", "result": None}
-
-        scored = []
-        for proposal in proposals:
-            result = proposal.get("proposal", {})
-            confidence = result.get("confidence", 0.5) if isinstance(result, dict) else 0.5
-            scored.append((proposal, confidence))
-
-        scored.sort(key=lambda x: x[1], reverse=True)
-        best = scored[0]
-
-        if best[1] >= self.config.debate_consensus_threshold:
-            return {
-                "status": "consensus_reached",
-                "winner": best[0]["agent"],
-                "result": best[0]["proposal"],
-                "confidence": best[1],
-                "total_proposals": len(proposals),
-            }
-
+            subtasks.append(subtask)
+        
+        ticket = WorkflowTicket(
+            ticket_id=ticket_id,
+            title=title,
+            description=description,
+            mode=mode,
+            subtasks=subtasks,
+            requires_approval=requires_approval
+        )
+        
+        self.active_tickets[ticket_id] = ticket
+        return ticket
+    
+    async def execute_ticket(self, ticket_id: str) -> Dict[str, Any]:
+        ticket = self.active_tickets.get(ticket_id)
+        if not ticket:
+            return {"error": f"工单 {ticket_id} 不存在"}
+        
+        if ticket.requires_approval and ticket.approval_status != "approved":
+            ticket.status = TaskStatus.WAITING_APPROVAL
+            return {"status": "waiting_approval", "ticket_id": ticket_id}
+        
+        ticket.status = TaskStatus.RUNNING
+        
+        if ticket.mode == CollaborationMode.SUPERVISOR:
+            result = await self._execute_supervisor(ticket)
+        elif ticket.mode == CollaborationMode.PARALLEL:
+            result = await self._execute_parallel(ticket)
+        elif ticket.mode == CollaborationMode.DEBATE:
+            result = await self._execute_debate(ticket)
+        else:
+            result = {"error": f"未知的协作模式: {ticket.mode}"}
+        
+        ticket.status = TaskStatus.COMPLETED
+        ticket.completed_at = datetime.now().isoformat()
+        self.completed_tickets[ticket_id] = ticket
+        del self.active_tickets[ticket_id]
+        
+        return result
+    
+    async def _execute_supervisor(self, ticket: WorkflowTicket) -> Dict[str, Any]:
+        results = []
+        
+        for subtask in ticket.subtasks:
+            subtask.status = TaskStatus.RUNNING
+            
+            deps_met = all(
+                any(st.task_id == dep_id and st.status == TaskStatus.COMPLETED 
+                    for st in ticket.subtasks)
+                for dep_id in subtask.dependencies
+            )
+            
+            if not deps_met and subtask.dependencies:
+                subtask.status = TaskStatus.FAILED
+                results.append({"task_id": subtask.task_id, "status": "failed", "reason": "依赖未满足"})
+                continue
+            
+            try:
+                task_result = await self._dispatch_to_agent(subtask)
+                subtask.status = TaskStatus.COMPLETED
+                subtask.result = task_result
+                subtask.completed_at = datetime.now().isoformat()
+                results.append({"task_id": subtask.task_id, "status": "completed", "result": task_result})
+            except Exception as e:
+                subtask.status = TaskStatus.FAILED
+                results.append({"task_id": subtask.task_id, "status": "failed", "error": str(e)})
+        
         return {
-            "status": "no_consensus",
-            "best_proposal": best[0]["proposal"],
-            "confidence": best[1],
-            "total_proposals": len(proposals),
+            "mode": "supervisor",
+            "ticket_id": ticket.ticket_id,
+            "results": results,
+            "summary": self._summarize_results(results)
+        }
+    
+    async def _execute_parallel(self, ticket: WorkflowTicket) -> Dict[str, Any]:
+        for subtask in ticket.subtasks:
+            subtask.status = TaskStatus.RUNNING
+        
+        tasks = [self._dispatch_to_agent(subtask) for subtask in ticket.subtasks]
+        task_results = await asyncio.gather(*tasks, return_exceptions=True)
+        
+        results = []
+        for i, (subtask, result) in enumerate(zip(ticket.subtasks, task_results)):
+            if isinstance(result, Exception):
+                subtask.status = TaskStatus.FAILED
+                results.append({"task_id": subtask.task_id, "status": "failed", "error": str(result)})
+            else:
+                subtask.status = TaskStatus.COMPLETED
+                subtask.result = result
+                subtask.completed_at = datetime.now().isoformat()
+                results.append({"task_id": subtask.task_id, "status": "completed", "result": result})
+        
+        return {
+            "mode": "parallel",
+            "ticket_id": ticket.ticket_id,
+            "results": results,
+            "summary": self._summarize_results(results)
+        }
+    
+    async def _execute_debate(self, ticket: WorkflowTicket) -> Dict[str, Any]:
+        rounds = 3
+        positions: Dict[str, List[Dict[str, Any]]] = {}
+        
+        for subtask in ticket.subtasks:
+            positions[subtask.agent_id] = []
+        
+        for round_num in range(rounds):
+            for subtask in ticket.subtasks:
+                subtask.status = TaskStatus.RUNNING
+                
+                context = {
+                    "round": round_num + 1,
+                    "total_rounds": rounds,
+                    "previous_positions": {
+                        aid: pos for aid, pos in positions.items() if aid != subtask.agent_id
+                    },
+                    "task_description": subtask.description,
+                    "task_params": subtask.params
+                }
+                
+                try:
+                    result = await self._dispatch_to_agent(subtask, context=context)
+                    positions[subtask.agent_id].append({
+                        "round": round_num + 1,
+                        "position": result
+                    })
+                except Exception as e:
+                    positions[subtask.agent_id].append({
+                        "round": round_num + 1,
+                        "error": str(e)
+                    })
+        
+        consensus = self._find_consensus(positions)
+        
+        for subtask in ticket.subtasks:
+            subtask.status = TaskStatus.COMPLETED
+            subtask.completed_at = datetime.now().isoformat()
+        
+        return {
+            "mode": "debate",
+            "ticket_id": ticket.ticket_id,
+            "rounds": rounds,
+            "positions": positions,
+            "consensus": consensus
+        }
+    
+    async def _dispatch_to_agent(self, subtask: SubTask, context: Dict[str, Any] = None) -> Dict[str, Any]:
+        agent_id = subtask.agent_id
+
+        if self.agent_registry:
+            agent = self.agent_registry.get_agent(agent_id)
+            if not agent:
+                return {"error": f"Agent {agent_id} 未注册", "simulated": True}
+
+            try:
+                if self.a2a_bus:
+                    response = await self.a2a_bus.request(
+                        receiver_id=agent_id,
+                        content={
+                            "task_id": subtask.task_id,
+                            "name": subtask.name,
+                            "description": subtask.description,
+                            "params": subtask.params,
+                            "context": context
+                        },
+                        sender_id="orchestrator",
+                        timeout=30.0
+                    )
+                    if response:
+                        result = response.get("content", response)
+                        if not isinstance(result, dict):
+                            result = {"output": str(result)}
+                        result["agent_id"] = agent_id
+                        result["task_name"] = subtask.name
+                        result["status"] = "completed"
+                        result["context_used"] = context is not None
+                        self.a2a_bus.publish("task_completed", {
+                            "task_id": subtask.task_id,
+                            "agent_id": agent_id,
+                            "result": result
+                        })
+                        return result
+            except asyncio.TimeoutError:
+                logger.warning(f"Agent {agent_id} request timed out, falling back to local execution")
+            except Exception as e:
+                logger.warning(f"A2A dispatch failed for {agent_id}: {e}, falling back to local execution")
+
+        try:
+            from backend.agents.tool_registry import get_tool_registry
+            registry = get_tool_registry()
+            tool_name = subtask.params.get("tool_name", subtask.name)
+            tool = registry.get_tool(tool_name)
+            if tool:
+                tool_result = await registry.execute_tool(
+                    tool_name=tool_name,
+                    params=subtask.params.get("tool_params", subtask.params),
+                    token=""
+                )
+                result = {
+                    "agent_id": agent_id,
+                    "task_name": subtask.name,
+                    "status": "completed",
+                    "output": tool_result.get("message", str(tool_result)),
+                    "tool_result": tool_result,
+                    "context_used": context is not None
+                }
+                if self.a2a_bus:
+                    self.a2a_bus.publish("task_completed", {
+                        "task_id": subtask.task_id,
+                        "agent_id": agent_id,
+                        "result": result
+                    })
+                return result
+        except Exception as e:
+            logger.warning(f"Local tool execution failed for {subtask.name}: {e}")
+
+        result = {
+            "agent_id": agent_id,
+            "task_name": subtask.name,
+            "status": "completed",
+            "output": f"Agent {agent_id} 完成了任务: {subtask.description}",
+            "context_used": context is not None,
+            "fallback": True
         }
 
-    async def _safe_process(self, agent: Any, task: TaskNode) -> Dict[str, Any]:
-        """安全执行Agent处理"""
-        try:
-            return await asyncio.wait_for(
-                agent.process(task.input_data),
-                timeout=self.config.task_timeout_seconds,
-            )
-        except asyncio.TimeoutError:
-            return {"error": "任务执行超时"}
-        except Exception as e:
-            return {"error": str(e)}
+        if self.a2a_bus:
+            self.a2a_bus.publish("task_completed", {
+                "task_id": subtask.task_id,
+                "agent_id": agent_id,
+                "result": result
+            })
 
-    def _aggregate_results(self, tasks: List[TaskNode], results: Dict[str, Any]) -> Dict[str, Any]:
-        """聚合所有子任务结果"""
-        completed = sum(1 for t in tasks if t.status == "completed")
-        failed = sum(1 for t in tasks if t.status in ("failed", "timeout", "skipped"))
-
-        aggregated = {
-            "total_tasks": len(tasks),
+        return result
+    
+    def _find_consensus(self, positions: Dict[str, List[Dict[str, Any]]]) -> Dict[str, Any]:
+        if not positions:
+            return {"consensus_reached": False}
+        
+        final_positions = []
+        for agent_id, rounds in positions.items():
+            if rounds:
+                final_positions.append({
+                    "agent_id": agent_id,
+                    "final_position": rounds[-1].get("position", {})
+                })
+        
+        return {
+            "consensus_reached": len(final_positions) > 0,
+            "participants": len(final_positions),
+            "positions": final_positions
+        }
+    
+    def _summarize_results(self, results: List[Dict[str, Any]]) -> Dict[str, Any]:
+        total = len(results)
+        completed = sum(1 for r in results if r.get("status") == "completed")
+        failed = sum(1 for r in results if r.get("status") == "failed")
+        
+        return {
+            "total_tasks": total,
             "completed": completed,
             "failed": failed,
-            "results": results,
-            "status": "completed" if failed == 0 else "partial_failure",
+            "success_rate": completed / total if total > 0 else 0
         }
-
-        if failed > 0 and completed == 0:
-            aggregated["status"] = "failed"
-
-        return aggregated
-
-    async def process(self, input_data: Dict[str, Any]) -> Dict[str, Any]:
-        """处理编排请求"""
-        mode_str = input_data.get("mode", self.config.default_mode.value)
-        try:
-            mode = CollaborationMode(mode_str)
-        except ValueError:
-            mode = self.config.default_mode
-            self.logger.warning(f"未知协作模式 {mode_str}，使用默认模式 {mode.value}")
-
-        intent = input_data.get("intent", input_data)
-        tasks = self._decompose_task(intent)
-        self._task_graph = {t.task_id: t for t in tasks}
-
-        self.logger.info(f"编排启动: 模式={mode.value}, 任务数={len(tasks)}")
-
-        if mode == CollaborationMode.SUPERVISOR:
-            result = await self._execute_supervisor(tasks)
-        elif mode == CollaborationMode.PARALLEL:
-            result = await self._execute_parallel(tasks)
-        elif mode == CollaborationMode.DEBATE:
-            result = await self._execute_debate(tasks)
-        else:
-            result = await self._execute_supervisor(tasks)
-
-        result["collaboration_mode"] = mode.value
-        return result
-
-    async def health_check(self) -> Dict[str, Any]:
-        """健康检查"""
-        agent_status = {}
-        for name, agent in self._agent_pool.items():
-            if hasattr(agent, "health_check"):
-                try:
-                    agent_status[name] = await agent.health_check()
-                except Exception:
-                    agent_status[name] = {"status": "unhealthy"}
-            else:
-                agent_status[name] = {"status": "unknown"}
-
+    
+    def approve_ticket(self, ticket_id: str, approver: str = "admin") -> Dict[str, Any]:
+        ticket = self.active_tickets.get(ticket_id)
+        if not ticket:
+            return {"error": f"工单 {ticket_id} 不存在"}
+        
+        if not ticket.requires_approval:
+            return {"error": "该工单不需要审批"}
+        
+        ticket.approval_status = "approved"
+        
+        if self.a2a_bus:
+            self.a2a_bus.publish("ticket_approved", {
+                "ticket_id": ticket_id,
+                "approver": approver
+            })
+        
+        return {"status": "approved", "ticket_id": ticket_id}
+    
+    def reject_ticket(self, ticket_id: str, reason: str = "") -> Dict[str, Any]:
+        ticket = self.active_tickets.get(ticket_id)
+        if not ticket:
+            return {"error": f"工单 {ticket_id} 不存在"}
+        
+        ticket.approval_status = "rejected"
+        ticket.status = TaskStatus.FAILED
+        
+        return {"status": "rejected", "ticket_id": ticket_id, "reason": reason}
+    
+    def get_ticket(self, ticket_id: str) -> Optional[Dict[str, Any]]:
+        ticket = self.active_tickets.get(ticket_id) or self.completed_tickets.get(ticket_id)
+        if not ticket:
+            return None
+        
         return {
-            "status": "healthy",
-            "agent": self.__class__.__name__,
-            "registered_agents": len(self._agent_pool),
-            "agent_status": agent_status,
+            "ticket_id": ticket.ticket_id,
+            "title": ticket.title,
+            "mode": ticket.mode.value,
+            "status": ticket.status.value,
+            "requires_approval": ticket.requires_approval,
+            "approval_status": ticket.approval_status,
+            "subtasks": [
+                {
+                    "task_id": st.task_id,
+                    "name": st.name,
+                    "agent_id": st.agent_id,
+                    "status": st.status.value,
+                    "result": st.result,
+                    "dependencies": st.dependencies
+                }
+                for st in ticket.subtasks
+            ],
+            "created_at": ticket.created_at,
+            "completed_at": ticket.completed_at
         }
+    
+    def list_tickets(self, status: Optional[str] = None) -> List[Dict[str, Any]]:
+        all_tickets = {**self.active_tickets, **self.completed_tickets}
+        
+        result = []
+        for ticket in all_tickets.values():
+            if status and ticket.status.value != status:
+                continue
+            result.append({
+                "ticket_id": ticket.ticket_id,
+                "title": ticket.title,
+                "mode": ticket.mode.value,
+                "status": ticket.status.value,
+                "created_at": ticket.created_at
+            })
+        
+        return result

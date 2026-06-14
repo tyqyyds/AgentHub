@@ -1,484 +1,622 @@
-"""剧本引擎 - 预定义操作剧本的执行引擎"""
-
+from typing import List, Dict, Optional, Any
+from datetime import datetime, timezone
+from sqlalchemy import select, func, or_
+from sqlalchemy.ext.asyncio import AsyncSession
+from backend.database.connection import async_session_maker
+from backend.database.models import Playbook, PlaybookExecution
+import asyncio
+import uuid
 import logging
-import time
-from dataclasses import dataclass, field
-from enum import Enum
-from typing import Any, Optional
-
-from ..core.config import settings
-from ..database.models import PlaybookExecutionStatus
 
 logger = logging.getLogger(__name__)
 
 
-class StepType(Enum):
-    """步骤类型"""
-    COMMAND = "command"           # 执行命令
-    CONDITION = "condition"       # 条件判断
-    DELAY = "delay"               # 延时等待
-    NOTIFICATION = "notification" # 发送通知
-    APPROVAL = "approval"         # 等待审批
-    SUB_PLAYBOOK = "sub_playbook" # 子剧本
+def _generate_id(prefix: str) -> str:
+    return f"{prefix}_{uuid.uuid4().hex[:8]}"
 
 
-class StepStatus(Enum):
-    """步骤状态"""
-    PENDING = "pending"
-    RUNNING = "running"
-    COMPLETED = "completed"
-    FAILED = "failed"
-    SKIPPED = "skipped"
-    WAITING_APPROVAL = "waiting_approval"
+def _serialize_playbook(pb: Playbook) -> dict:
+    return {
+        "id": pb.id,
+        "playbook_id": pb.playbook_id,
+        "name": pb.name,
+        "description": pb.description,
+        "category": pb.category,
+        "steps": pb.steps,
+        "parameters_schema": pb.parameters_schema,
+        "is_public": pb.is_public,
+        "author": pb.author,
+        "version": pb.version,
+        "execution_count": pb.execution_count,
+        "last_execution_status": pb.last_execution_status,
+        "tags": pb.tags,
+        "created_at": pb.created_at.isoformat() if pb.created_at else None,
+        "updated_at": pb.updated_at.isoformat() if pb.updated_at else None,
+    }
 
 
-@dataclass
-class PlaybookStep:
-    """剧本步骤"""
-    step_id: str
-    name: str
-    step_type: StepType
-    action: str
-    params: dict[str, Any] = field(default_factory=dict)
-    condition: Optional[str] = None      # 条件表达式
-    on_failure: str = "abort"            # abort / skip / continue
-    timeout_seconds: int = 60
-    retry_count: int = 0
-    retry_delay_seconds: int = 5
-
-
-@dataclass
-class PlaybookDefinition:
-    """剧本定义"""
-    playbook_id: str
-    name: str
-    description: str
-    steps: list[PlaybookStep]
-    trigger_condition: Optional[dict[str, Any]] = None
-    version: str = "1.0"
-    created_by: str = "system"
-
-
-@dataclass
-class ExecutionContext:
-    """执行上下文"""
-    execution_id: str
-    playbook_id: str
-    current_step_index: int = 0
-    step_results: list[dict[str, Any]] = field(default_factory=list)
-    variables: dict[str, Any] = field(default_factory=dict)
-    started_at: float = field(default_factory=time.time)
-    status: PlaybookExecutionStatus = PlaybookExecutionStatus.RUNNING
-
-
-@dataclass
-class PlaybookEngineConfig:
-    """剧本引擎配置"""
-    max_concurrent_executions: int = 10
-    default_step_timeout: int = 60
-    max_retry_per_step: int = 3
-    enable_auto_approval: bool = False
-    execution_history_limit: int = 100
-
-
-# 预定义剧本
-BUILTIN_PLAYBOOKS: dict[str, PlaybookDefinition] = {
-    "link_failover": PlaybookDefinition(
-        playbook_id="link_failover",
-        name="链路故障切换",
-        description="当主链路故障时自动切换到备用链路",
-        steps=[
-            PlaybookStep(
-                step_id="s1", name="检测链路状态", step_type=StepType.COMMAND,
-                action="check_link_status", params={"interface": "{{primary_interface}}"},
-                timeout_seconds=10,
-            ),
-            PlaybookStep(
-                step_id="s2", name="确认故障", step_type=StepType.CONDITION,
-                action="confirm_failure", condition="link_status == 'down'",
-                on_failure="abort",
-            ),
-            PlaybookStep(
-                step_id="s3", name="启用备用链路", step_type=StepType.COMMAND,
-                action="enable_backup_link", params={"interface": "{{backup_interface}}"},
-                retry_count=2,
-            ),
-            PlaybookStep(
-                step_id="s4", name="验证切换结果", step_type=StepType.COMMAND,
-                action="verify_link_status", params={"interface": "{{backup_interface}}"},
-            ),
-            PlaybookStep(
-                step_id="s5", name="发送通知", step_type=StepType.NOTIFICATION,
-                action="notify_failover", params={"message": "链路切换完成"},
-            ),
-        ],
-        trigger_condition={"event_type": "link_down"},
-    ),
-    "device_reboot_recovery": PlaybookDefinition(
-        playbook_id="device_reboot_recovery",
-        name="设备重启恢复",
-        description="设备异常重启后的自动恢复流程",
-        steps=[
-            PlaybookStep(
-                step_id="s1", name="等待设备上线", step_type=StepType.DELAY,
-                action="wait", params={"seconds": 30},
-            ),
-            PlaybookStep(
-                step_id="s2", name="检查设备状态", step_type=StepType.COMMAND,
-                action="check_device_health", params={"device": "{{device_name}}"},
-            ),
-            PlaybookStep(
-                step_id="s3", name="恢复配置", step_type=StepType.COMMAND,
-                action="restore_config", params={"device": "{{device_name}}"},
-                retry_count=3, retry_delay_seconds=10,
-            ),
-            PlaybookStep(
-                step_id="s4", name="验证服务", step_type=StepType.COMMAND,
-                action="verify_services", params={"device": "{{device_name}}"},
-            ),
-        ],
-        trigger_condition={"event_type": "device_reboot"},
-    ),
-    "qos_emergency": PlaybookDefinition(
-        playbook_id="qos_emergency",
-        name="QoS紧急调整",
-        description="网络拥塞时紧急调整QoS策略",
-        steps=[
-            PlaybookStep(
-                step_id="s1", name="评估拥塞程度", step_type=StepType.COMMAND,
-                action="assess_congestion", params={"threshold": "80%"},
-            ),
-            PlaybookStep(
-                step_id="s2", name="申请审批", step_type=StepType.APPROVAL,
-                action="request_approval", params={"risk_level": "high"},
-            ),
-            PlaybookStep(
-                step_id="s3", name="调整QoS策略", step_type=StepType.COMMAND,
-                action="adjust_qos", params={"policy": "emergency", "device": "{{device_name}}"},
-            ),
-            PlaybookStep(
-                step_id="s4", name="监控效果", step_type=StepType.DELAY,
-                action="wait", params={"seconds": 60},
-            ),
-            PlaybookStep(
-                step_id="s5", name="验证改善", step_type=StepType.COMMAND,
-                action="verify_improvement",
-            ),
-        ],
-        trigger_condition={"event_type": "congestion_detected"},
-    ),
-}
+def _serialize_execution(ex: PlaybookExecution) -> dict:
+    return {
+        "id": ex.id,
+        "execution_id": ex.execution_id,
+        "playbook_id": ex.playbook_id,
+        "status": ex.status,
+        "current_step_index": ex.current_step_index,
+        "parameter_values": ex.parameter_values,
+        "step_results": ex.step_results,
+        "triggered_by": ex.triggered_by,
+        "started_at": ex.started_at.isoformat() if ex.started_at else None,
+        "completed_at": ex.completed_at.isoformat() if ex.completed_at else None,
+        "error_message": ex.error_message,
+        "created_at": ex.created_at.isoformat() if ex.created_at else None,
+    }
 
 
 class PlaybookEngine:
-    """剧本引擎 - 预定义操作剧本的执行引擎"""
+    def __init__(self):
+        self._running_executions: Dict[str, asyncio.Task] = {}
 
-    def __init__(self, config: Optional[PlaybookEngineConfig] = None):
-        self.config = config or PlaybookEngineConfig()
-        self._playbooks: dict[str, PlaybookDefinition] = dict(BUILTIN_PLAYBOOKS)
-        self._active_executions: dict[str, ExecutionContext] = {}
-        self._execution_history: list[dict[str, Any]] = []
-        self._execution_counter: int = 0
-        self._stats: dict[str, int] = {
-            "total_executions": 0,
-            "completed": 0,
-            "failed": 0,
-            "aborted": 0,
-            "step_timeouts": 0,
-            "step_retries": 0,
-        }
-        logger.info(f"剧本引擎初始化完成, 已加载{len(self._playbooks)}个预定义剧本")
-
-    def _generate_execution_id(self) -> str:
-        """生成执行ID"""
-        self._execution_counter += 1
-        return f"exec_{int(time.time())}_{self._execution_counter}"
-
-    def register_playbook(self, playbook: PlaybookDefinition) -> None:
-        """注册剧本"""
-        self._playbooks[playbook.playbook_id] = playbook
-        logger.info(f"注册剧本: {playbook.playbook_id} ({playbook.name})")
-
-    def unregister_playbook(self, playbook_id: str) -> bool:
-        """注销剧本"""
-        if playbook_id in self._playbooks:
-            del self._playbooks[playbook_id]
-            logger.info(f"注销剧本: {playbook_id}")
-            return True
-        return False
-
-    def list_playbooks(self) -> list[dict[str, Any]]:
-        """列出所有剧本"""
-        return [
-            {
-                "playbook_id": p.playbook_id,
-                "name": p.name,
-                "description": p.description,
-                "steps_count": len(p.steps),
-                "version": p.version,
-            }
-            for p in self._playbooks.values()
-        ]
-
-    def get_playbook(self, playbook_id: str) -> Optional[PlaybookDefinition]:
-        """获取剧本定义"""
-        return self._playbooks.get(playbook_id)
-
-    def _resolve_variables(self, text: str, variables: dict[str, Any]) -> str:
-        """解析变量引用 {{var_name}}"""
-        import re
-        def replacer(match: re.Match) -> str:
-            var_name = match.group(1)
-            return str(variables.get(var_name, match.group(0)))
-        return re.sub(r"\{\{(\w+)\}\}", replacer, text)
-
-    def _execute_step_action(
+    async def create_playbook(
         self,
-        step: PlaybookStep,
-        context: ExecutionContext,
-    ) -> dict[str, Any]:
-        """执行步骤动作（模拟）"""
-        resolved_action = self._resolve_variables(step.action, context.variables)
-        resolved_params = {
-            k: self._resolve_variables(str(v), context.variables) if isinstance(v, str) else v
-            for k, v in step.params.items()
-        }
+        name: str,
+        description: str,
+        category: str,
+        steps: list,
+        author: str,
+        **kwargs,
+    ) -> Playbook:
+        async with async_session_maker() as session:
+            playbook_id = _generate_id("pb")
+            pb = Playbook(
+                playbook_id=playbook_id,
+                name=name,
+                description=description,
+                category=category,
+                steps=steps,
+                author=author,
+                parameters_schema=kwargs.get("parameters_schema"),
+                is_public=kwargs.get("is_public", True),
+                tags=kwargs.get("tags", []),
+            )
+            session.add(pb)
+            try:
+                await session.commit()
+            except Exception as e:
+                await session.rollback()
+                raise e
+            await session.refresh(pb)
+            logger.info(f"Created playbook {playbook_id}: {name}")
+            return pb
 
-        # 模拟不同步骤类型的执行
-        if step.step_type == StepType.COMMAND:
-            result = {"action": resolved_action, "params": resolved_params, "output": f"模拟执行: {resolved_action}", "success": True}
-        elif step.step_type == StepType.CONDITION:
-            condition_met = True  # 简化：默认条件满足
-            if step.condition:
-                condition_met = "down" in step.condition.lower() or "true" in step.condition.lower()
-            result = {"action": resolved_action, "condition_met": condition_met, "success": condition_met}
-        elif step.step_type == StepType.DELAY:
-            delay_secs = resolved_params.get("seconds", 5)
-            result = {"action": "delay", "seconds": delay_secs, "success": True}
-        elif step.step_type == StepType.NOTIFICATION:
-            result = {"action": resolved_action, "message": resolved_params.get("message", ""), "success": True}
-        elif step.step_type == StepType.APPROVAL:
-            if self.config.enable_auto_approval:
-                result = {"action": resolved_action, "approved": True, "success": True}
-            else:
-                result = {"action": resolved_action, "approved": False, "waiting": True, "success": True}
-        elif step.step_type == StepType.SUB_PLAYBOOK:
-            result = {"action": resolved_action, "sub_playbook_id": resolved_params.get("playbook_id", ""), "success": True}
-        else:
-            result = {"action": resolved_action, "success": False, "error": "未知步骤类型"}
+    async def list_playbooks(
+        self,
+        category: Optional[str] = None,
+        is_public: Optional[bool] = None,
+        author: Optional[str] = None,
+        search: Optional[str] = None,
+        limit: int = 20,
+        offset: int = 0,
+    ) -> List[dict]:
+        async with async_session_maker() as session:
+            query = select(Playbook)
+            if category is not None:
+                query = query.where(Playbook.category == category)
+            if is_public is not None:
+                query = query.where(Playbook.is_public == is_public)
+            if author is not None:
+                query = query.where(Playbook.author == author)
+            if search is not None:
+                query = query.where(
+                    or_(
+                        Playbook.name.contains(search),
+                        Playbook.description.contains(search),
+                    )
+                )
+            query = query.order_by(Playbook.created_at.desc()).offset(offset).limit(limit)
+            result = await session.execute(query)
+            playbooks = result.scalars().all()
+            return [_serialize_playbook(pb) for pb in playbooks]
 
-        return result
+    async def get_playbook(self, playbook_id: str) -> Optional[dict]:
+        async with async_session_maker() as session:
+            result = await session.execute(
+                select(Playbook).where(Playbook.playbook_id == playbook_id)
+            )
+            pb = result.scalar_one_or_none()
+            if pb is None:
+                return None
+            return _serialize_playbook(pb)
 
-    def start_execution(
+    async def update_playbook(self, playbook_id: str, **kwargs) -> Optional[dict]:
+        async with async_session_maker() as session:
+            result = await session.execute(
+                select(Playbook).where(Playbook.playbook_id == playbook_id)
+            )
+            pb = result.scalar_one_or_none()
+            if pb is None:
+                return None
+            for key, value in kwargs.items():
+                if hasattr(pb, key) and value is not None:
+                    setattr(pb, key, value)
+            pb.updated_at = datetime.now(timezone.utc)
+            await session.commit()
+            await session.refresh(pb)
+            logger.info(f"Updated playbook {playbook_id}")
+            return _serialize_playbook(pb)
+
+    async def delete_playbook(self, playbook_id: str) -> bool:
+        async with async_session_maker() as session:
+            result = await session.execute(
+                select(Playbook).where(Playbook.playbook_id == playbook_id)
+            )
+            pb = result.scalar_one_or_none()
+            if pb is None:
+                return False
+            await session.delete(pb)
+            await session.commit()
+            logger.info(f"Deleted playbook {playbook_id}")
+            return True
+
+    async def execute_playbook(
         self,
         playbook_id: str,
-        variables: Optional[dict[str, Any]] = None,
-        triggered_by: str = "manual",
-    ) -> dict[str, Any]:
-        """启动剧本执行"""
-        playbook = self._playbooks.get(playbook_id)
-        if not playbook:
-            return {"status": "error", "message": f"剧本不存在: {playbook_id}"}
+        parameter_values: dict,
+        triggered_by: str,
+    ) -> PlaybookExecution:
+        async with async_session_maker() as session:
+            result = await session.execute(
+                select(Playbook).where(Playbook.playbook_id == playbook_id)
+            )
+            pb = result.scalar_one_or_none()
+            if pb is None:
+                raise ValueError(f"Playbook not found: {playbook_id}")
 
-        if len(self._active_executions) >= self.config.max_concurrent_executions:
-            return {"status": "error", "message": "并发执行数已达上限"}
+            execution_id = _generate_id("pbe")
+            execution = PlaybookExecution(
+                execution_id=execution_id,
+                playbook_id=playbook_id,
+                status="pending",
+                current_step_index=0,
+                parameter_values=parameter_values,
+                step_results=[],
+                triggered_by=triggered_by,
+            )
+            session.add(execution)
 
-        execution_id = self._generate_execution_id()
-        context = ExecutionContext(
-            execution_id=execution_id,
-            playbook_id=playbook_id,
-            variables=variables or {},
-        )
+            pb.execution_count += 1
+            await session.commit()
+            await session.refresh(execution)
 
-        self._active_executions[execution_id] = context
-        self._stats["total_executions"] += 1
+            logger.info(f"Started execution {execution_id} for playbook {playbook_id}")
 
-        logger.info(f"启动剧本执行: {playbook.name} (ID: {execution_id})")
+        task = asyncio.create_task(self._run_execution(execution_id))
+        self._running_executions[execution_id] = task
+
+        return execution
+
+    async def _run_execution(self, execution_id: str):
+        try:
+            async with async_session_maker() as session:
+                result = await session.execute(
+                    select(PlaybookExecution).where(
+                        PlaybookExecution.execution_id == execution_id
+                    )
+                )
+                execution = result.scalar_one_or_none()
+                if execution is None:
+                    return
+
+                execution.status = "running"
+                execution.started_at = datetime.now(timezone.utc)
+                await session.commit()
+
+            while True:
+                step_result = await self.execute_step(execution_id)
+                if step_result is None:
+                    break
+                if step_result.get("status") == "waiting_approval":
+                    break
+                if step_result.get("status") == "completed":
+                    break
+                if step_result.get("status") == "failed":
+                    break
+                if step_result.get("status") == "cancelled":
+                    break
+
+        except Exception as e:
+            logger.error(f"Execution {execution_id} failed: {e}", exc_info=True)
+            async with async_session_maker() as session:
+                result = await session.execute(
+                    select(PlaybookExecution).where(
+                        PlaybookExecution.execution_id == execution_id
+                    )
+                )
+                execution = result.scalar_one_or_none()
+                if execution:
+                    execution.status = "failed"
+                    execution.error_message = str(e)
+                    execution.completed_at = datetime.now(timezone.utc)
+                    await session.commit()
+                    await self._update_playbook_status(execution.playbook_id, "failed")
+        finally:
+            self._running_executions.pop(execution_id, None)
+
+    async def _update_playbook_status(self, playbook_id: str, status: str):
+        async with async_session_maker() as session:
+            result = await session.execute(
+                select(Playbook).where(Playbook.playbook_id == playbook_id)
+            )
+            pb = result.scalar_one_or_none()
+            if pb:
+                pb.last_execution_status = status
+                await session.commit()
+
+    async def execute_step(self, execution_id: str) -> Optional[dict]:
+        async with async_session_maker() as session:
+            result = await session.execute(
+                select(PlaybookExecution).where(
+                    PlaybookExecution.execution_id == execution_id
+                )
+            )
+            execution = result.scalar_one_or_none()
+            if execution is None:
+                return None
+
+            if execution.status in ("completed", "failed", "cancelled"):
+                return {"status": execution.status}
+
+            pb_result = await session.execute(
+                select(Playbook).where(Playbook.playbook_id == execution.playbook_id)
+            )
+            pb = pb_result.scalar_one_or_none()
+            if pb is None:
+                return None
+
+            steps = pb.steps or []
+            step_index = execution.current_step_index
+
+            if step_index >= len(steps):
+                execution.status = "completed"
+                execution.completed_at = datetime.now(timezone.utc)
+                await session.commit()
+                await self._update_playbook_status(execution.playbook_id, "completed")
+                return {"status": "completed", "step_index": step_index}
+
+            step = steps[step_index]
+            step_type = step.get("type", "")
+            step_params = step.get("params", {})
+            parameter_values = execution.parameter_values or {}
+
+            try:
+                if step_type == "intent":
+                    step_result_data = await self._execute_intent_step(step_params, parameter_values)
+                elif step_type == "approval":
+                    execution.status = "running"
+                    await session.commit()
+                    step_results = list(execution.step_results or [])
+                    step_results.append({
+                        "step_index": step_index,
+                        "step_id": step.get("id"),
+                        "step_name": step.get("name"),
+                        "type": "approval",
+                        "status": "waiting_approval",
+                        "started_at": datetime.now(timezone.utc).isoformat(),
+                    })
+                    execution.step_results = step_results
+                    await session.commit()
+                    return {"status": "waiting_approval", "step_index": step_index}
+                elif step_type == "tool_call":
+                    step_result_data = await self._execute_tool_call_step(step_params, parameter_values)
+                elif step_type == "wait":
+                    step_result_data = await self._execute_wait_step(step_params)
+                elif step_type == "condition":
+                    step_result_data = await self._execute_condition_step(step_params, parameter_values, step)
+                elif step_type == "notification":
+                    step_result_data = await self._execute_notification_step(step_params, execution)
+                else:
+                    step_result_data = {"status": "skipped", "reason": f"Unknown step type: {step_type}"}
+
+                step_results = list(execution.step_results or [])
+                step_results.append({
+                    "step_index": step_index,
+                    "step_id": step.get("id"),
+                    "step_name": step.get("name"),
+                    "type": step_type,
+                    "result": step_result_data,
+                    "completed_at": datetime.now(timezone.utc).isoformat(),
+                })
+                execution.step_results = step_results
+
+                if step_type == "condition" and step_result_data.get("branch_next_step") is not None:
+                    next_step_id = step_result_data["branch_next_step"]
+                    next_index = self._find_step_index(steps, next_step_id)
+                    if next_index is not None:
+                        execution.current_step_index = next_index
+                    else:
+                        execution.current_step_index = step_index + 1
+                else:
+                    next_step = step.get("next_step")
+                    if next_step:
+                        next_index = self._find_step_index(steps, next_step)
+                        if next_index is not None:
+                            execution.current_step_index = next_index
+                        else:
+                            execution.current_step_index = step_index + 1
+                    else:
+                        execution.current_step_index = step_index + 1
+
+                await session.commit()
+
+                if execution.current_step_index >= len(steps):
+                    execution.status = "completed"
+                    execution.completed_at = datetime.now(timezone.utc)
+                    await session.commit()
+                    await self._update_playbook_status(execution.playbook_id, "completed")
+                    return {"status": "completed", "step_index": step_index}
+
+                return {"status": "step_completed", "step_index": step_index, "result": step_result_data}
+
+            except Exception as e:
+                logger.error(f"Step execution failed for {execution_id} step {step_index}: {e}", exc_info=True)
+                execution.status = "failed"
+                execution.error_message = f"Step {step_index} ({step_type}) failed: {str(e)}"
+                execution.completed_at = datetime.now(timezone.utc)
+                step_results = list(execution.step_results or [])
+                step_results.append({
+                    "step_index": step_index,
+                    "step_id": step.get("id"),
+                    "step_name": step.get("name"),
+                    "type": step_type,
+                    "status": "failed",
+                    "error": str(e),
+                    "completed_at": datetime.now(timezone.utc).isoformat(),
+                })
+                execution.step_results = step_results
+                await session.commit()
+                await self._update_playbook_status(execution.playbook_id, "failed")
+                return {"status": "failed", "step_index": step_index, "error": str(e)}
+
+    def _find_step_index(self, steps: list, step_id: str) -> Optional[int]:
+        for i, s in enumerate(steps):
+            if s.get("id") == step_id:
+                return i
+        return None
+
+    async def _execute_intent_step(self, params: dict, parameter_values: dict) -> dict:
+        from backend.agents.intent_parser import IntentParserAgent
+        user_input = params.get("user_input", "")
+        for key, value in parameter_values.items():
+            user_input = user_input.replace(f"{{{{{key}}}}}", str(value))
+        parser = IntentParserAgent()
+        parsed = parser.parse(user_input)
         return {
-            "status": "started",
-            "execution_id": execution_id,
-            "playbook_id": playbook_id,
-            "total_steps": len(playbook.steps),
+            "status": "success",
+            "intent_type": parsed.intent_type,
+            "actions": parsed.actions,
+            "entities": parsed.entities,
         }
 
-    def execute_step(self, execution_id: str) -> dict[str, Any]:
-        """执行下一步"""
-        context = self._active_executions.get(execution_id)
-        if not context:
-            return {"status": "error", "message": f"执行不存在: {execution_id}"}
+    async def _execute_tool_call_step(self, params: dict, parameter_values: dict) -> dict:
+        from backend.agents.tool_registry import get_tool_registry
+        tool_name = params.get("tool_name", "")
+        tool_params = dict(params.get("tool_params", {}))
+        for key, value in parameter_values.items():
+            for pk, pv in tool_params.items():
+                if isinstance(pv, str) and f"{{{{{key}}}}}" in pv:
+                    tool_params[pk] = pv.replace(f"{{{{{key}}}}}", str(value))
+        registry = get_tool_registry()
+        result = await registry.execute_tool(tool_name, tool_params, "")
+        return {"status": "success", "tool_name": tool_name, "result": result}
 
-        playbook = self._playbooks.get(context.playbook_id)
-        if not playbook:
-            return {"status": "error", "message": "剧本定义丢失"}
+    async def _execute_wait_step(self, params: dict) -> dict:
+        duration_seconds = params.get("duration_seconds", 0)
+        await asyncio.sleep(duration_seconds)
+        return {"status": "success", "waited_seconds": duration_seconds}
 
-        if context.current_step_index >= len(playbook.steps):
-            context.status = PlaybookExecutionStatus.COMPLETED
-            self._stats["completed"] += 1
-            self._archive_execution(context)
-            return {"status": "completed", "execution_id": execution_id}
+    async def _execute_condition_step(self, params: dict, parameter_values: dict, step: dict) -> dict:
+        condition_field = params.get("field", "")
+        condition_operator = params.get("operator", "==")
+        condition_value = params.get("value", "")
 
-        step = playbook.steps[context.current_step_index]
-        step_result = self._execute_step_action(step, context)
+        actual_value = parameter_values.get(condition_field, "")
 
-        # 处理条件步骤失败
-        if step.step_type == StepType.CONDITION and not step_result.get("condition_met", True):
-            if step.on_failure == "abort":
-                context.status = PlaybookExecutionStatus.FAILED
-                self._stats["aborted"] += 1
-                self._archive_execution(context)
-                return {"status": "aborted", "reason": "条件不满足", "step": step.name}
+        condition_met = False
+        if condition_operator == "==":
+            condition_met = str(actual_value) == str(condition_value)
+        elif condition_operator == "!=":
+            condition_met = str(actual_value) != str(condition_value)
+        elif condition_operator == ">":
+            try:
+                condition_met = float(actual_value) > float(condition_value)
+            except (ValueError, TypeError):
+                condition_met = False
+        elif condition_operator == "<":
+            try:
+                condition_met = float(actual_value) < float(condition_value)
+            except (ValueError, TypeError):
+                condition_met = False
+        elif condition_operator == "in":
+            condition_met = str(actual_value) in str(condition_value)
+        elif condition_operator == "contains":
+            condition_met = str(condition_value) in str(actual_value)
 
-        # 处理审批等待
-        if step.step_type == StepType.APPROVAL and step_result.get("waiting"):
+        branch_next_step = params.get("next_step_if_true") if condition_met else params.get("next_step_if_false")
+
+        return {
+            "status": "success",
+            "condition_met": condition_met,
+            "branch_next_step": branch_next_step,
+        }
+
+    async def _execute_notification_step(self, params: dict, execution: PlaybookExecution) -> dict:
+        from backend.core.websocket_manager import manager
+        message = params.get("message", "")
+        target_user = params.get("target_user", "")
+        notification = {
+            "type": "playbook_notification",
+            "data": {
+                "execution_id": execution.execution_id,
+                "playbook_id": execution.playbook_id,
+                "message": message,
+                "step_index": execution.current_step_index,
+            },
+        }
+        if target_user:
+            await manager.send_to_user(target_user, notification)
+        else:
+            await manager.broadcast(notification)
+        return {"status": "success", "notification_sent": True, "target_user": target_user or "all"}
+
+    async def approve_step(self, execution_id: str, approver: str) -> Optional[dict]:
+        async with async_session_maker() as session:
+            result = await session.execute(
+                select(PlaybookExecution).where(
+                    PlaybookExecution.execution_id == execution_id
+                )
+            )
+            execution = result.scalar_one_or_none()
+            if execution is None:
+                return None
+
+            step_results = list(execution.step_results or [])
+            current_step_result = None
+            current_step_idx = None
+            for i, sr in enumerate(step_results):
+                if sr.get("status") == "waiting_approval":
+                    current_step_result = sr
+                    current_step_idx = i
+                    break
+
+            if current_step_result is None:
+                raise ValueError("No step awaiting approval")
+
+            step_results[current_step_idx]["status"] = "approved"
+            step_results[current_step_idx]["approved_by"] = approver
+            step_results[current_step_idx]["approved_at"] = datetime.now(timezone.utc).isoformat()
+            execution.step_results = step_results
+
+            pb_result = await session.execute(
+                select(Playbook).where(Playbook.playbook_id == execution.playbook_id)
+            )
+            pb = pb_result.scalar_one_or_none()
+            steps = pb.steps if pb else []
+            step_index = execution.current_step_index
+            if step_index < len(steps):
+                step = steps[step_index]
+                next_step = step.get("next_step")
+                if next_step:
+                    next_index = self._find_step_index(steps, next_step)
+                    if next_index is not None:
+                        execution.current_step_index = next_index
+                    else:
+                        execution.current_step_index = step_index + 1
+                else:
+                    execution.current_step_index = step_index + 1
+
+            await session.commit()
+            logger.info(f"Step approved for execution {execution_id} by {approver}")
+
+        task = asyncio.create_task(self._run_execution(execution_id))
+        self._running_executions[execution_id] = task
+
+        async with async_session_maker() as session:
+            result = await session.execute(
+                select(PlaybookExecution).where(
+                    PlaybookExecution.execution_id == execution_id
+                )
+            )
+            execution = result.scalar_one_or_none()
+            if execution:
+                return _serialize_execution(execution)
+        return None
+
+    async def cancel_execution(self, execution_id: str) -> bool:
+        async with async_session_maker() as session:
+            result = await session.execute(
+                select(PlaybookExecution).where(
+                    PlaybookExecution.execution_id == execution_id
+                )
+            )
+            execution = result.scalar_one_or_none()
+            if execution is None:
+                return False
+            if execution.status in ("completed", "failed", "cancelled"):
+                return False
+            execution.status = "cancelled"
+            execution.completed_at = datetime.now(timezone.utc)
+            await session.commit()
+            await self._update_playbook_status(execution.playbook_id, "cancelled")
+
+        task = self._running_executions.pop(execution_id, None)
+        if task and not task.done():
+            task.cancel()
+
+        logger.info(f"Cancelled execution {execution_id}")
+        return True
+
+    async def get_execution(self, execution_id: str) -> Optional[dict]:
+        async with async_session_maker() as session:
+            result = await session.execute(
+                select(PlaybookExecution).where(
+                    PlaybookExecution.execution_id == execution_id
+                )
+            )
+            execution = result.scalar_one_or_none()
+            if execution is None:
+                return None
+            return _serialize_execution(execution)
+
+    async def list_executions(
+        self,
+        playbook_id: Optional[str] = None,
+        status: Optional[str] = None,
+        limit: int = 20,
+        offset: int = 0,
+    ) -> List[dict]:
+        async with async_session_maker() as session:
+            query = select(PlaybookExecution)
+            if playbook_id is not None:
+                query = query.where(PlaybookExecution.playbook_id == playbook_id)
+            if status is not None:
+                query = query.where(PlaybookExecution.status == status)
+            query = query.order_by(PlaybookExecution.created_at.desc()).offset(offset).limit(limit)
+            result = await session.execute(query)
+            executions = result.scalars().all()
+            return [_serialize_execution(ex) for ex in executions]
+
+    async def get_execution_status(self, execution_id: str) -> Optional[dict]:
+        async with async_session_maker() as session:
+            result = await session.execute(
+                select(PlaybookExecution).where(
+                    PlaybookExecution.execution_id == execution_id
+                )
+            )
+            execution = result.scalar_one_or_none()
+            if execution is None:
+                return None
+
+            pb_result = await session.execute(
+                select(Playbook).where(Playbook.playbook_id == execution.playbook_id)
+            )
+            pb = pb_result.scalar_one_or_none()
+            steps = pb.steps if pb else []
+            total_steps = len(steps)
+            completed_steps = len([sr for sr in (execution.step_results or []) if sr.get("status") != "waiting_approval"])
+
             return {
-                "status": "waiting_approval",
-                "execution_id": execution_id,
-                "step": step.name,
-                "step_index": context.current_step_index,
+                **_serialize_execution(execution),
+                "total_steps": total_steps,
+                "completed_steps": completed_steps,
+                "progress": completed_steps / total_steps if total_steps > 0 else 0.0,
+                "current_step": steps[execution.current_step_index] if execution.current_step_index < total_steps else None,
             }
 
-        # 记录步骤结果
-        context.step_results.append({
-            "step_id": step.step_id,
-            "step_name": step.name,
-            "step_type": step.step_type.value,
-            "result": step_result,
-            "executed_at": time.time(),
-        })
 
-        # 更新变量
-        if step_result.get("output"):
-            context.variables[f"step_{step.step_id}_output"] = step_result["output"]
+_playbook_engine: Optional[PlaybookEngine] = None
 
-        context.current_step_index += 1
 
-        logger.info(f"剧本步骤完成: {step.name} (执行: {execution_id})")
-
-        return {
-            "status": "step_completed",
-            "execution_id": execution_id,
-            "step": step.name,
-            "step_index": context.current_step_index,
-            "total_steps": len(playbook.steps),
-            "step_result": step_result,
-        }
-
-    def execute_all(self, execution_id: str) -> dict[str, Any]:
-        """执行所有步骤直到完成或失败"""
-        results = []
-        while True:
-            step_result = self.execute_step(execution_id)
-            results.append(step_result)
-            if step_result["status"] in ("completed", "aborted", "error", "waiting_approval"):
-                break
-        return {
-            "execution_id": execution_id,
-            "final_status": results[-1]["status"],
-            "steps_executed": len(results),
-            "results": results,
-        }
-
-    def cancel_execution(self, execution_id: str) -> dict[str, Any]:
-        """取消执行"""
-        context = self._active_executions.get(execution_id)
-        if not context:
-            return {"status": "error", "message": f"执行不存在: {execution_id}"}
-        context.status = PlaybookExecutionStatus.FAILED
-        self._stats["aborted"] += 1
-        self._archive_execution(context)
-        return {"status": "cancelled", "execution_id": execution_id}
-
-    def _archive_execution(self, context: ExecutionContext) -> None:
-        """归档执行记录"""
-        record = {
-            "execution_id": context.execution_id,
-            "playbook_id": context.playbook_id,
-            "status": context.status.value,
-            "steps_completed": len(context.step_results),
-            "started_at": context.started_at,
-            "completed_at": time.time(),
-            "duration": time.time() - context.started_at,
-        }
-        self._execution_history.append(record)
-        if len(self._execution_history) > self.config.execution_history_limit:
-            self._execution_history = self._execution_history[-self.config.execution_history_limit:]
-        self._active_executions.pop(context.execution_id, None)
-
-    def get_execution_status(self, execution_id: str) -> Optional[dict[str, Any]]:
-        """获取执行状态"""
-        context = self._active_executions.get(execution_id)
-        if not context:
-            for h in self._execution_history:
-                if h["execution_id"] == execution_id:
-                    return h
-            return None
-
-        playbook = self._playbooks.get(context.playbook_id)
-        return {
-            "execution_id": context.execution_id,
-            "playbook_id": context.playbook_id,
-            "playbook_name": playbook.name if playbook else "未知",
-            "status": context.status.value,
-            "current_step": context.current_step_index,
-            "total_steps": len(playbook.steps) if playbook else 0,
-            "steps_completed": len(context.step_results),
-            "started_at": context.started_at,
-        }
-
-    def get_stats(self) -> dict[str, Any]:
-        """获取统计信息"""
-        return self._stats
-
-    async def process(self, input_data: dict[str, Any]) -> dict[str, Any]:
-        """Agent标准处理接口"""
-        action = input_data.get("action", "execute")
-
-        if action == "list":
-            return {"playbooks": self.list_playbooks()}
-        elif action == "start":
-            return self.start_execution(
-                playbook_id=input_data.get("playbook_id", ""),
-                variables=input_data.get("variables"),
-                triggered_by=input_data.get("triggered_by", "api"),
-            )
-        elif action == "step":
-            return self.execute_step(execution_id=input_data.get("execution_id", ""))
-        elif action == "execute_all":
-            return self.execute_all(execution_id=input_data.get("execution_id", ""))
-        elif action == "cancel":
-            return self.cancel_execution(execution_id=input_data.get("execution_id", ""))
-        elif action == "status":
-            result = self.get_execution_status(execution_id=input_data.get("execution_id", ""))
-            return result or {"status": "error", "message": "执行不存在"}
-        elif action == "register":
-            pb_data = input_data.get("playbook", {})
-            steps = [
-                PlaybookStep(
-                    step_id=s.get("step_id", f"s{i}"),
-                    name=s.get("name", ""),
-                    step_type=StepType(s.get("step_type", "command")),
-                    action=s.get("action", ""),
-                    params=s.get("params", {}),
-                )
-                for i, s in enumerate(pb_data.get("steps", []))
-            ]
-            pb = PlaybookDefinition(
-                playbook_id=pb_data.get("playbook_id", ""),
-                name=pb_data.get("name", ""),
-                description=pb_data.get("description", ""),
-                steps=steps,
-            )
-            self.register_playbook(pb)
-            return {"status": "registered", "playbook_id": pb.playbook_id}
-        else:
-            return {"error": f"未知操作: {action}"}
-
-    async def health_check(self) -> dict[str, Any]:
-        """健康检查"""
-        return {
-            "status": "healthy",
-            "playbooks_count": len(self._playbooks),
-            "active_executions": len(self._active_executions),
-            "history_size": len(self._execution_history),
-            "stats": self._stats,
-        }
+def get_playbook_engine() -> PlaybookEngine:
+    global _playbook_engine
+    if _playbook_engine is None:
+        _playbook_engine = PlaybookEngine()
+    return _playbook_engine

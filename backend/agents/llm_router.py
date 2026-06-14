@@ -1,264 +1,466 @@
-"""LLM路由 - 按任务类型路由到不同LLM，支持动态路由规则和优先级调整"""
-
-import logging
 import time
+import logging
+from typing import Dict, Any, Optional, List
 from dataclasses import dataclass, field
-from enum import Enum
-from typing import Any, Optional
 
-from ..core.config import settings
-from .llm_gateway import LLMGateway, LLMProvider, LLMRequest, LLMResponse, LLMTaskType
+from backend.core.config import settings
 
 logger = logging.getLogger(__name__)
 
+WEIGHT_SUCCESS_RATE = 0.4
+WEIGHT_LATENCY = 0.3
+WEIGHT_COST = 0.2
+WEIGHT_FEATURE = 0.1
 
-class RouteStrategy(Enum):
-    """路由策略"""
-    PRIORITY = "priority"
-    ROUND_ROBIN = "round_robin"
-    LEAST_LATENCY = "least_latency"
-    COST_OPTIMIZED = "cost_optimized"
+DEFAULT_MAX_LATENCY_MS = 30000.0
+DEFAULT_COST_PER_1K = 0.01
+
+TASK_TYPE_DEFAULTS = {
+    "intent_parse": {"prefer_low_cost": True, "prefer_low_latency": True, "require_function_calling": False},
+    "copilot_chat": {"prefer_low_cost": False, "prefer_low_latency": False, "require_function_calling": False},
+    "copilot_stream": {"prefer_low_cost": False, "prefer_low_latency": True, "require_function_calling": False},
+    "config_generate": {"prefer_low_cost": False, "prefer_low_latency": False, "require_function_calling": False},
+    "fault_diagnose": {"prefer_low_cost": False, "prefer_low_latency": False, "require_function_calling": False},
+    "clarification": {"prefer_low_cost": True, "prefer_low_latency": True, "require_function_calling": False},
+}
 
 
 @dataclass
-class RouteRule:
-    """路由规则"""
-    task_type: LLMTaskType
-    primary_provider: LLMProvider
-    fallback_provider: LLMProvider
-    priority: int = 1
+class ProviderConfig:
+    name: str
+    api_url: str
+    api_key: str
+    model: str
+    max_tokens: int = 4096
+    cost_per_1k_input: float = 0.0
+    cost_per_1k_output: float = 0.0
+    supports_streaming: bool = True
+    supports_function_calling: bool = False
     enabled: bool = True
-    conditions: dict[str, Any] = field(default_factory=dict)
+
+    @property
+    def cost_per_1k_tokens(self) -> float:
+        return (self.cost_per_1k_input + self.cost_per_1k_output) / 2
+
+    @property
+    def available(self) -> bool:
+        return self.enabled and bool(self.api_key)
 
 
 @dataclass
-class LLMRouterConfig:
-    """LLM路由配置"""
-    default_strategy: RouteStrategy = RouteStrategy.PRIORITY
-    enable_dynamic_routing: bool = True
-    latency_window_seconds: int = 300
-    cost_weights: dict[str, float] = field(default_factory=lambda: {
-        "deepseek": 0.3,
-        "zhipu": 0.7,
-    })
+class ProviderMetrics:
+    total_requests: int = 0
+    success_count: int = 0
+    avg_latency_ms: float = 0.0
+    total_tokens: int = 0
+    total_cost: float = 0.0
+    last_used: Optional[float] = None
+
+    @property
+    def success_rate(self) -> float:
+        if self.total_requests == 0:
+            return 0.5
+        return self.success_count / self.total_requests
 
 
-class LatencyTracker:
-    """延迟追踪器"""
+@dataclass
+class TaskMetrics:
+    total_requests: int = 0
+    success_count: int = 0
+    total_latency_ms: float = 0.0
+    total_tokens: int = 0
 
-    def __init__(self, window_seconds: int = 300):
-        self.window_seconds = window_seconds
-        self._records: dict[LLMProvider, list[tuple[float, float]]] = {
-            LLMProvider.DEEPSEEK: [],
-            LLMProvider.ZHIPU: [],
-        }
+    @property
+    def avg_latency_ms(self) -> float:
+        if self.success_count == 0:
+            return DEFAULT_MAX_LATENCY_MS
+        return self.total_latency_ms / self.success_count
 
-    def record(self, provider: LLMProvider, latency_ms: float):
-        now = time.time()
-        self._records[provider].append((now, latency_ms))
-        self._cleanup(provider)
+    @property
+    def success_rate(self) -> float:
+        if self.total_requests == 0:
+            return 0.5
+        return self.success_count / self.total_requests
 
-    def get_avg_latency(self, provider: LLMProvider) -> float:
-        self._cleanup(provider)
-        records = self._records.get(provider, [])
-        if not records:
-            return 0.0
-        return sum(r[1] for r in records) / len(records)
 
-    def _cleanup(self, provider: LLMProvider):
-        now = time.time()
-        cutoff = now - self.window_seconds
-        self._records[provider] = [
-            r for r in self._records[provider] if r[0] > cutoff
-        ]
+def _build_builtin_providers() -> Dict[str, ProviderConfig]:
+    providers = {}
+
+    providers["zhipu"] = ProviderConfig(
+        name="zhipu",
+        api_url=settings.zhipu_api_url,
+        api_key=settings.zhipu_api_key,
+        model=settings.zhipu_model,
+        max_tokens=4096,
+        cost_per_1k_input=0.0001,
+        cost_per_1k_output=0.0001,
+        supports_streaming=True,
+        supports_function_calling=True,
+        enabled=True,
+    )
+
+    providers["deepseek"] = ProviderConfig(
+        name="deepseek",
+        api_url=settings.deepseek_api_url,
+        api_key=settings.deepseek_api_key,
+        model=settings.deepseek_model,
+        max_tokens=4096,
+        cost_per_1k_input=0.001,
+        cost_per_1k_output=0.002,
+        supports_streaming=True,
+        supports_function_calling=True,
+        enabled=True,
+    )
+
+    providers["openai"] = ProviderConfig(
+        name="openai",
+        api_url="https://api.openai.com/v1/chat/completions",
+        api_key=settings.openai_api_key,
+        model=settings.openai_model,
+        max_tokens=4096,
+        cost_per_1k_input=0.01,
+        cost_per_1k_output=0.03,
+        supports_streaming=True,
+        supports_function_calling=True,
+        enabled=False,
+    )
+
+    providers["qwen"] = ProviderConfig(
+        name="qwen",
+        api_url="https://dashscope.aliyuncs.com/compatible-mode/v1/chat/completions",
+        api_key="",
+        model="qwen-max",
+        max_tokens=4096,
+        cost_per_1k_input=0.004,
+        cost_per_1k_output=0.012,
+        supports_streaming=True,
+        supports_function_calling=True,
+        enabled=False,
+    )
+
+    if settings.openai_compatible_api_url and settings.openai_compatible_api_key:
+        providers["custom"] = ProviderConfig(
+            name="custom",
+            api_url=settings.openai_compatible_api_url,
+            api_key=settings.openai_compatible_api_key,
+            model=settings.openai_compatible_model or "default",
+            max_tokens=4096,
+            cost_per_1k_input=0.001,
+            cost_per_1k_output=0.002,
+            supports_streaming=True,
+            supports_function_calling=False,
+            enabled=True,
+        )
+
+    return providers
 
 
 class LLMRouter:
-    """LLM路由 - 按任务类型智能路由到不同LLM"""
+    def __init__(self):
+        self._providers: Dict[str, ProviderConfig] = _build_builtin_providers()
+        self._metrics: Dict[str, ProviderMetrics] = {
+            name: ProviderMetrics() for name in self._providers
+        }
+        self._task_metrics: Dict[str, Dict[str, TaskMetrics]] = {}
+        self._enabled = settings.llm_router_enabled
 
-    def __init__(
+    @property
+    def enabled(self) -> bool:
+        return self._enabled
+
+    def register_provider(self, provider_config: dict) -> ProviderConfig:
+        name = provider_config.get("name")
+        if not name:
+            raise ValueError("provider_config 必须包含 name 字段")
+
+        config = ProviderConfig(
+            name=name,
+            api_url=provider_config.get("api_url", ""),
+            api_key=provider_config.get("api_key", ""),
+            model=provider_config.get("model", ""),
+            max_tokens=provider_config.get("max_tokens", 4096),
+            cost_per_1k_input=provider_config.get("cost_per_1k_input", 0.0),
+            cost_per_1k_output=provider_config.get("cost_per_1k_output", 0.0),
+            supports_streaming=provider_config.get("supports_streaming", True),
+            supports_function_calling=provider_config.get("supports_function_calling", False),
+            enabled=provider_config.get("enabled", True),
+        )
+
+        self._providers[name] = config
+        if name not in self._metrics:
+            self._metrics[name] = ProviderMetrics()
+
+        logger.info(f"LLM Router: 注册 provider '{name}' (model={config.model})")
+        return config
+
+    def update_provider(self, name: str, updates: dict) -> Optional[ProviderConfig]:
+        if name not in self._providers:
+            return None
+
+        config = self._providers[name]
+        for key, value in updates.items():
+            if hasattr(config, key) and key != "name":
+                setattr(config, key, value)
+
+        logger.info(f"LLM Router: 更新 provider '{name}'")
+        return config
+
+    def remove_provider(self, name: str) -> bool:
+        if name not in self._providers:
+            return False
+
+        del self._providers[name]
+        self._metrics.pop(name, None)
+        for task_metrics in self._task_metrics.values():
+            task_metrics.pop(name, None)
+
+        logger.info(f"LLM Router: 移除 provider '{name}'")
+        return True
+
+    def toggle_provider(self, name: str) -> Optional[ProviderConfig]:
+        if name not in self._providers:
+            return None
+
+        config = self._providers[name]
+        config.enabled = not config.enabled
+        status = "启用" if config.enabled else "禁用"
+        logger.info(f"LLM Router: {status} provider '{name}'")
+        return config
+
+    def select_model(self, task_type: str, preferences: dict = None) -> str:
+        if not self._enabled:
+            return self._fallback_select(task_type)
+
+        prefs = dict(TASK_TYPE_DEFAULTS.get(task_type, {}))
+        if preferences:
+            prefs.update(preferences)
+
+        candidates = []
+        for name, config in self._providers.items():
+            if not config.available:
+                continue
+            if prefs.get("require_function_calling") and not config.supports_function_calling:
+                continue
+
+            metrics = self._metrics.get(name, ProviderMetrics())
+            task_m = self._get_task_metrics(name, task_type)
+
+            score = self._calculate_score(config, metrics, task_m, prefs)
+            candidates.append((name, score))
+
+        if not candidates:
+            fallback = self._fallback_select(task_type)
+            if fallback is not None:
+                return fallback
+            logger.warning(f"No available LLM provider for task type '{task_type}'")
+            return None
+
+        candidates.sort(key=lambda x: x[1], reverse=True)
+        selected = candidates[0][0]
+        logger.debug(f"LLM Router: 为任务 '{task_type}' 选择 provider '{selected}' (score={candidates[0][1]:.4f})")
+        return selected
+
+    def _calculate_score(
         self,
-        gateway: Optional[LLMGateway] = None,
-        config: Optional[LLMRouterConfig] = None,
+        config: ProviderConfig,
+        metrics: ProviderMetrics,
+        task_metrics: TaskMetrics,
+        preferences: dict,
+    ) -> float:
+        success_rate = task_metrics.success_rate
+        success_score = success_rate
+
+        avg_latency = task_metrics.avg_latency_ms
+        latency_score = max(0.0, 1.0 - avg_latency / DEFAULT_MAX_LATENCY_MS)
+
+        cost = config.cost_per_1k_tokens
+        max_cost = 0.05
+        cost_score = max(0.0, 1.0 - cost / max_cost)
+
+        feature_score = 0.5
+        if config.supports_streaming:
+            feature_score += 0.25
+        if config.supports_function_calling:
+            feature_score += 0.25
+
+        if preferences.get("prefer_low_cost"):
+            cost_score *= 1.5
+        if preferences.get("prefer_low_latency"):
+            latency_score *= 1.5
+        if preferences.get("require_function_calling") and config.supports_function_calling:
+            feature_score *= 1.5
+
+        total = (
+            WEIGHT_SUCCESS_RATE * success_score
+            + WEIGHT_LATENCY * latency_score
+            + WEIGHT_COST * cost_score
+            + WEIGHT_FEATURE * feature_score
+        )
+
+        return total
+
+    def _fallback_select(self, task_type: str) -> Optional[str]:
+        for name in ["zhipu", "deepseek"]:
+            if name in self._providers and self._providers[name].available:
+                return name
+        for name, config in self._providers.items():
+            if config.available:
+                return name
+        logger.warning(f"No available LLM provider for task type '{task_type}'")
+        return None
+
+    def record_result(
+        self,
+        provider: str,
+        task_type: str,
+        latency_ms: int,
+        success: bool,
+        tokens_used: int,
     ):
-        self.config = config or LLMRouterConfig()
-        self.gateway = gateway or LLMGateway()
-        self._rules: dict[LLMTaskType, RouteRule] = {}
-        self._latency_tracker = LatencyTracker(self.config.latency_window_seconds)
-        self._round_robin_index = 0
-        self._stats: dict[str, int] = {
-            "total_routed": 0,
-            "deepseek_routed": 0,
-            "zhipu_routed": 0,
-            "fallback_triggered": 0,
-        }
-        self._init_default_rules()
-        logger.info("LLM路由初始化完成")
+        if provider not in self._providers:
+            return
 
-    def _init_default_rules(self):
-        """初始化默认路由规则"""
-        default_rules = [
-            RouteRule(
-                task_type=LLMTaskType.INTENT_PARSE,
-                primary_provider=LLMProvider.ZHIPU,
-                fallback_provider=LLMProvider.DEEPSEEK,
-                priority=1,
-                conditions={"requires_function_calling": True},
-            ),
-            RouteRule(
-                task_type=LLMTaskType.COPILOT_CHAT,
-                primary_provider=LLMProvider.DEEPSEEK,
-                fallback_provider=LLMProvider.ZHIPU,
-                priority=1,
-                conditions={"requires_long_context": True},
-            ),
-            RouteRule(
-                task_type=LLMTaskType.CONFIG_GENERATE,
-                primary_provider=LLMProvider.ZHIPU,
-                fallback_provider=LLMProvider.DEEPSEEK,
-                priority=1,
-                conditions={"requires_structured_output": True},
-            ),
-            RouteRule(
-                task_type=LLMTaskType.FAULT_DIAGNOSE,
-                primary_provider=LLMProvider.ZHIPU,
-                fallback_provider=LLMProvider.DEEPSEEK,
-                priority=1,
-                conditions={"requires_reasoning": True},
-            ),
-            RouteRule(
-                task_type=LLMTaskType.COPILOT_STREAM,
-                primary_provider=LLMProvider.DEEPSEEK,
-                fallback_provider=LLMProvider.ZHIPU,
-                priority=1,
-                conditions={"requires_streaming": True},
-            ),
-            RouteRule(
-                task_type=LLMTaskType.GENERAL,
-                primary_provider=LLMProvider.DEEPSEEK,
-                fallback_provider=LLMProvider.ZHIPU,
-                priority=2,
-            ),
-        ]
-        for rule in default_rules:
-            self._rules[rule.task_type] = rule
+        metrics = self._metrics.get(provider)
+        if metrics is None:
+            metrics = ProviderMetrics()
+            self._metrics[provider] = metrics
 
-    def add_rule(self, rule: RouteRule):
-        """添加路由规则"""
-        self._rules[rule.task_type] = rule
-        logger.info(f"添加路由规则: {rule.task_type.value} -> {rule.primary_provider.value}")
+        metrics.total_requests += 1
+        if success:
+            metrics.success_count += 1
+            current_avg = metrics.avg_latency_ms
+            total_success = metrics.success_count
+            metrics.avg_latency_ms = (
+                (current_avg * (total_success - 1) + latency_ms) / total_success
+            )
+        metrics.total_tokens += tokens_used
+        config = self._providers[provider]
+        metrics.total_cost += (tokens_used / 1000.0) * config.cost_per_1k_tokens
+        metrics.last_used = time.time()
 
-    def remove_rule(self, task_type: LLMTaskType):
-        """移除路由规则"""
-        if task_type in self._rules:
-            del self._rules[task_type]
-            logger.info(f"移除路由规则: {task_type.value}")
+        task_m = self._get_task_metrics(provider, task_type)
+        task_m.total_requests += 1
+        if success:
+            task_m.success_count += 1
+            task_m.total_latency_ms += latency_ms
+        task_m.total_tokens += tokens_used
 
-    def _route_by_priority(self, task_type: LLMTaskType) -> LLMProvider:
-        """按优先级路由"""
-        rule = self._rules.get(task_type)
-        if rule and rule.enabled:
-            return rule.primary_provider
-        return LLMProvider.DEEPSEEK
+    def _get_task_metrics(self, provider: str, task_type: str) -> TaskMetrics:
+        if task_type not in self._task_metrics:
+            self._task_metrics[task_type] = {}
+        task_map = self._task_metrics[task_type]
+        if provider not in task_map:
+            task_map[provider] = TaskMetrics()
+        return task_map[provider]
 
-    def _route_by_round_robin(self) -> LLMProvider:
-        """轮询路由"""
-        providers = list(LLMProvider)
-        provider = providers[self._round_robin_index % len(providers)]
-        self._round_robin_index += 1
-        return provider
+    def get_provider_status(self) -> Dict[str, Any]:
+        result = {}
+        for name, config in self._providers.items():
+            metrics = self._metrics.get(name, ProviderMetrics())
+            result[name] = {
+                "name": config.name,
+                "model": config.model,
+                "api_url": config.api_url,
+                "enabled": config.enabled,
+                "available": config.available,
+                "supports_streaming": config.supports_streaming,
+                "supports_function_calling": config.supports_function_calling,
+                "cost_per_1k_input": config.cost_per_1k_input,
+                "cost_per_1k_output": config.cost_per_1k_output,
+                "max_tokens": config.max_tokens,
+                "metrics": {
+                    "total_requests": metrics.total_requests,
+                    "success_count": metrics.success_count,
+                    "success_rate": round(metrics.success_rate, 4),
+                    "avg_latency_ms": round(metrics.avg_latency_ms, 1),
+                    "total_tokens": metrics.total_tokens,
+                    "total_cost": round(metrics.total_cost, 6),
+                    "last_used": metrics.last_used,
+                },
+            }
+        return result
 
-    def _route_by_least_latency(self, task_type: LLMTaskType) -> LLMProvider:
-        """按最低延迟路由"""
-        deepseek_latency = self._latency_tracker.get_avg_latency(LLMProvider.DEEPSEEK)
-        zhipu_latency = self._latency_tracker.get_avg_latency(LLMProvider.ZHIPU)
+    def get_recommendations(self, task_type: str) -> Dict[str, Any]:
+        prefs = TASK_TYPE_DEFAULTS.get(task_type, {})
+        candidates = []
 
-        if deepseek_latency == 0 and zhipu_latency == 0:
-            return self._route_by_priority(task_type)
+        for name, config in self._providers.items():
+            if not config.available:
+                continue
 
-        if deepseek_latency <= zhipu_latency:
-            return LLMProvider.DEEPSEEK
-        return LLMProvider.ZHIPU
+            metrics = self._metrics.get(name, ProviderMetrics())
+            task_m = self._get_task_metrics(name, task_type)
+            score = self._calculate_score(config, metrics, task_m, prefs)
 
-    def _route_by_cost(self, task_type: LLMTaskType) -> LLMProvider:
-        """按成本优化路由"""
-        rule = self._rules.get(task_type)
-        if rule and rule.conditions.get("requires_function_calling"):
-            return LLMProvider.ZHIPU
-        if rule and rule.conditions.get("requires_long_context"):
-            return LLMProvider.DEEPSEEK
-        return LLMProvider.DEEPSEEK
+            candidates.append({
+                "provider": name,
+                "model": config.model,
+                "score": round(score, 4),
+                "success_rate": round(task_m.success_rate, 4),
+                "avg_latency_ms": round(task_m.avg_latency_ms, 1),
+                "cost_per_1k_tokens": config.cost_per_1k_tokens,
+                "supports_function_calling": config.supports_function_calling,
+                "supports_streaming": config.supports_streaming,
+            })
 
-    def route(self, task_type: LLMTaskType) -> LLMProvider:
-        """根据策略路由到LLM提供商"""
-        strategy_map = {
-            RouteStrategy.PRIORITY: self._route_by_priority,
-            RouteStrategy.ROUND_ROBIN: lambda _: self._route_by_round_robin(),
-            RouteStrategy.LEAST_LATENCY: self._route_by_least_latency,
-            RouteStrategy.COST_OPTIMIZED: self._route_by_cost,
-        }
-        router = strategy_map.get(self.config.default_strategy, self._route_by_priority)
-        provider = router(task_type)
+        candidates.sort(key=lambda x: x["score"], reverse=True)
 
-        self._stats["total_routed"] += 1
-        if provider == LLMProvider.DEEPSEEK:
-            self._stats["deepseek_routed"] += 1
-        else:
-            self._stats["zhipu_routed"] += 1
-
-        logger.debug(f"路由决策: {task_type.value} -> {provider.value} (策略: {self.config.default_strategy.value})")
-        return provider
-
-    async def route_and_call(self, request: LLMRequest) -> LLMResponse:
-        """路由并调用LLM"""
-        provider = self.route(request.task_type)
-        request.metadata["routed_provider"] = provider.value
-
-        response = await self.gateway.call(request)
-
-        if response.success:
-            self._latency_tracker.record(response.provider, response.latency_ms)
-        else:
-            rule = self._rules.get(request.task_type)
-            if rule and rule.enabled:
-                fallback = rule.fallback_provider
-                logger.warning(f"主提供商 {provider.value} 失败，降级到 {fallback.value}")
-                self._stats["fallback_triggered"] += 1
-                request.metadata["fallback_from"] = provider.value
-                response = await self.gateway.call(request)
-
-        return response
-
-    def get_routing_stats(self) -> dict[str, Any]:
-        """获取路由统计"""
         return {
-            "stats": self._stats,
-            "latency": {
-                "deepseek_avg_ms": self._latency_tracker.get_avg_latency(LLMProvider.DEEPSEEK),
-                "zhipu_avg_ms": self._latency_tracker.get_avg_latency(LLMProvider.ZHIPU),
-            },
-            "rules": {
-                tt.value: {
-                    "primary": r.primary_provider.value,
-                    "fallback": r.fallback_provider.value,
-                    "enabled": r.enabled,
+            "task_type": task_type,
+            "preferences": prefs,
+            "recommendations": candidates,
+            "best_choice": candidates[0]["provider"] if candidates else None,
+        }
+
+    def get_metrics(self) -> Dict[str, Any]:
+        total_requests = sum(m.total_requests for m in self._metrics.values())
+        total_success = sum(m.success_count for m in self._metrics.values())
+        total_cost = sum(m.total_cost for m in self._metrics.values())
+        total_tokens = sum(m.total_tokens for m in self._metrics.values())
+
+        provider_summaries = {}
+        for name, metrics in self._metrics.items():
+            config = self._providers.get(name)
+            provider_summaries[name] = {
+                "model": config.model if config else "unknown",
+                "total_requests": metrics.total_requests,
+                "success_rate": round(metrics.success_rate, 4),
+                "avg_latency_ms": round(metrics.avg_latency_ms, 1),
+                "total_cost": round(metrics.total_cost, 6),
+            }
+
+        task_summaries = {}
+        for task_type, task_map in self._task_metrics.items():
+            task_summaries[task_type] = {
+                provider: {
+                    "total_requests": tm.total_requests,
+                    "success_rate": round(tm.success_rate, 4),
+                    "avg_latency_ms": round(tm.avg_latency_ms, 1),
                 }
-                for tt, r in self._rules.items()
-            },
-            "strategy": self.config.default_strategy.value,
-        }
+                for provider, tm in task_map.items()
+            }
 
-    async def process(self, request: LLMRequest) -> LLMResponse:
-        """Agent标准处理接口"""
-        return await self.route_and_call(request)
-
-    async def health_check(self) -> dict[str, Any]:
-        """健康检查"""
-        gateway_health = await self.gateway.health_check()
         return {
-            "status": gateway_health.get("status", "unknown"),
-            "routing_strategy": self.config.default_strategy.value,
-            "rules_count": len(self._rules),
-            "stats": self._stats,
-            "gateway": gateway_health,
+            "router_enabled": self._enabled,
+            "total_requests": total_requests,
+            "total_success_rate": round(total_success / total_requests, 4) if total_requests > 0 else 0.0,
+            "total_cost": round(total_cost, 6),
+            "total_tokens": total_tokens,
+            "registered_providers": len(self._providers),
+            "available_providers": sum(1 for c in self._providers.values() if c.available),
+            "provider_summaries": provider_summaries,
+            "task_summaries": task_summaries,
         }
+
+    def get_provider_config(self, name: str) -> Optional[ProviderConfig]:
+        return self._providers.get(name)
+
+
+_llm_router_instance: Optional[LLMRouter] = None
+
+
+def get_llm_router() -> LLMRouter:
+    global _llm_router_instance
+    if _llm_router_instance is None:
+        _llm_router_instance = LLMRouter()
+    return _llm_router_instance

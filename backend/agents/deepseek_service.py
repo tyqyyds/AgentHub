@@ -1,362 +1,254 @@
-"""DeepSeek服务 - DeepSeek LLM调用封装，支持意图解析、对话增强、配置生成"""
-
-import logging
+import json
 import time
+import httpx
+import asyncio
+from typing import Dict, Any, Optional, List, AsyncGenerator
 from dataclasses import dataclass, field
-from typing import Any, AsyncIterator, Optional
 
-from ..core.config import settings
+from backend.core.config import settings
 
-logger = logging.getLogger(__name__)
+DEEPSEEK_API_URL = settings.deepseek_api_url
+DEEPSEEK_API_KEY = settings.deepseek_api_key
+DEEPSEEK_MODEL = settings.deepseek_model
 
-
-@dataclass
-class DeepSeekConfig:
-    """DeepSeek服务配置"""
-    api_key: str = ""
-    base_url: str = ""
-    model: str = ""
-    max_tokens: int = 4096
-    temperature: float = 0.7
-    timeout_seconds: int = 30
-    max_retries: int = 2
-    retry_delay_ms: int = 500
-
-    def __post_init__(self):
-        if not self.api_key:
-            self.api_key = settings.deepseek_api_key
-        if not self.base_url:
-            self.base_url = settings.deepseek_base_url
-        if not self.model:
-            self.model = settings.deepseek_model
-
+MAX_RETRIES = 3
+RETRY_DELAYS = [1, 2, 4]
+CONNECT_TIMEOUT = 10.0
+READ_TIMEOUT = 60.0
+MAX_CONTEXT_MESSAGES = 20
+MAX_CONTEXT_CHARS = 8000
 
 @dataclass
-class ChatMessage:
-    """聊天消息"""
+class DeepSeekMessage:
     role: str
     content: str
-    name: Optional[str] = None
-
 
 @dataclass
-class DeepSeekResponse:
-    """DeepSeek响应"""
-    content: str
-    model: str
-    usage: dict[str, int] = field(default_factory=dict)
-    latency_ms: float = 0.0
-    finish_reason: str = ""
-    success: bool = True
-    error: Optional[str] = None
-
+class CallStats:
+    total_calls: int = 0
+    success_calls: int = 0
+    failed_calls: int = 0
+    total_latency_ms: float = 0.0
+    last_call_time: Optional[float] = None
+    last_error: Optional[str] = None
 
 class DeepSeekService:
-    """DeepSeek服务 - 封装DeepSeek API调用"""
-
-    def __init__(self, config: Optional[DeepSeekConfig] = None):
-        self.config = config or DeepSeekConfig()
-        self._client = None
-        self._stats: dict[str, int] = {
-            "total_calls": 0,
-            "success_calls": 0,
-            "failed_calls": 0,
-            "total_tokens": 0,
-        }
-        logger.info(f"DeepSeek服务初始化, model={self.config.model}")
-
-    def _get_client(self):
-        """获取LangChain ChatOpenAI客户端"""
-        if self._client is None:
-            try:
-                from langchain_community.chat_models import ChatOpenAI
-
-                self._client = ChatOpenAI(
-                    api_key=self.config.api_key,
-                    base_url=self.config.base_url,
-                    model=self.config.model,
-                    temperature=self.config.temperature,
-                    max_tokens=self.config.max_tokens,
-                    timeout=self.config.timeout_seconds,
-                )
-            except ImportError:
-                logger.warning("langchain_community未安装，使用httpx直接调用")
-                self._client = None
+    def __init__(self, api_key: str = "", model: str = ""):
+        self.api_key = api_key or DEEPSEEK_API_KEY
+        self.model = model or DEEPSEEK_MODEL
+        self.api_url = DEEPSEEK_API_URL
+        self.available = bool(self.api_key)
+        self.stats = CallStats()
+        self._client: Optional[httpx.AsyncClient] = None
+    
+    async def _get_client(self) -> httpx.AsyncClient:
+        if self._client is None or self._client.is_closed:
+            self._client = httpx.AsyncClient(
+                timeout=httpx.Timeout(connect=CONNECT_TIMEOUT, read=READ_TIMEOUT, write=30.0, pool=30.0),
+                limits=httpx.Limits(max_connections=20, max_keepalive_connections=10)
+            )
         return self._client
-
+    
+    async def close(self):
+        if self._client and not self._client.is_closed:
+            await self._client.aclose()
+    
+    def _build_headers(self) -> Dict[str, str]:
+        return {
+            "Authorization": f"Bearer {self.api_key}",
+            "Content-Type": "application/json"
+        }
+    
+    def _build_payload(
+        self,
+        messages: List[DeepSeekMessage],
+        temperature: float = 0.7,
+        max_tokens: int = 2048,
+        stream: bool = False
+    ) -> Dict[str, Any]:
+        return {
+            "model": self.model,
+            "messages": [{"role": m.role, "content": m.content} for m in messages],
+            "temperature": temperature,
+            "max_tokens": max_tokens,
+            "stream": stream
+        }
+    
+    def _trim_context(self, messages: List[DeepSeekMessage], max_chars: int = MAX_CONTEXT_CHARS) -> List[DeepSeekMessage]:
+        total_chars = sum(len(m.content) for m in messages)
+        if total_chars <= max_chars:
+            return messages
+        
+        system_msgs = [m for m in messages if m.role == "system"]
+        other_msgs = [m for m in messages if m.role != "system"]
+        
+        while total_chars > max_chars and len(other_msgs) > 2:
+            removed = other_msgs.pop(0)
+            total_chars -= len(removed.content)
+        
+        return system_msgs + other_msgs
+    
     async def chat(
         self,
-        messages: list[ChatMessage],
-        temperature: Optional[float] = None,
-        max_tokens: Optional[int] = None,
-    ) -> DeepSeekResponse:
-        """聊天接口"""
-        start_time = time.time()
-        self._stats["total_calls"] += 1
-
-        try:
-            client = self._get_client()
-            if client is not None:
-                return await self._chat_via_langchain(
-                    client, messages, temperature, max_tokens, start_time
+        messages: List[DeepSeekMessage],
+        temperature: float = 0.7,
+        max_tokens: int = 2048
+    ) -> str:
+        if not self.available:
+            raise ValueError("DeepSeek API Key 未配置")
+        
+        messages = self._trim_context(messages)
+        payload = self._build_payload(messages, temperature, max_tokens, stream=False)
+        
+        last_error = None
+        for attempt in range(MAX_RETRIES):
+            start_time = time.time()
+            try:
+                client = await self._get_client()
+                response = await client.post(
+                    self.api_url,
+                    headers=self._build_headers(),
+                    json=payload
                 )
-            else:
-                return await self._chat_via_httpx(
-                    messages, temperature, max_tokens, start_time
-                )
-        except Exception as e:
-            latency_ms = (time.time() - start_time) * 1000
-            self._stats["failed_calls"] += 1
-            logger.error(f"DeepSeek聊天失败: {e}")
-            return DeepSeekResponse(
-                content="",
-                model=self.config.model,
-                latency_ms=latency_ms,
-                success=False,
-                error=str(e),
-            )
-
-    async def _chat_via_langchain(
-        self, client, messages, temperature, max_tokens, start_time
-    ) -> DeepSeekResponse:
-        """通过LangChain调用"""
-        from langchain_core.messages import HumanMessage, SystemMessage, AIMessage
-
-        lc_messages = []
-        for msg in messages:
-            if msg.role == "system":
-                lc_messages.append(SystemMessage(content=msg.content))
-            elif msg.role == "assistant":
-                lc_messages.append(AIMessage(content=msg.content))
-            else:
-                lc_messages.append(HumanMessage(content=msg.content))
-
-        if temperature is not None:
-            client.temperature = temperature
-        if max_tokens is not None:
-            client.max_tokens = max_tokens
-
-        response = await client.ainvoke(lc_messages)
-        latency_ms = (time.time() - start_time) * 1000
-
-        self._stats["success_calls"] += 1
-        return DeepSeekResponse(
-            content=response.content,
-            model=self.config.model,
-            latency_ms=latency_ms,
-            finish_reason="stop",
-            success=True,
-        )
-
-    async def _chat_via_httpx(
-        self, messages, temperature, max_tokens, start_time
-    ) -> DeepSeekResponse:
-        """通过httpx直接调用API"""
-        import httpx
-
-        url = f"{self.config.base_url}/chat/completions"
-        headers = {
-            "Authorization": f"Bearer {self.config.api_key}",
-            "Content-Type": "application/json",
-        }
-        payload = {
-            "model": self.config.model,
-            "messages": [{"role": m.role, "content": m.content} for m in messages],
-            "temperature": temperature or self.config.temperature,
-            "max_tokens": max_tokens or self.config.max_tokens,
-        }
-
-        async with httpx.AsyncClient(timeout=self.config.timeout_seconds) as http_client:
-            resp = await http_client.post(url, json=payload, headers=headers)
-            resp.raise_for_status()
-            data = resp.json()
-
-        latency_ms = (time.time() - start_time) * 1000
-        content = data.get("choices", [{}])[0].get("message", {}).get("content", "")
-        usage = data.get("usage", {})
-        self._stats["success_calls"] += 1
-        self._stats["total_tokens"] += usage.get("total_tokens", 0)
-
-        return DeepSeekResponse(
-            content=content,
-            model=self.config.model,
-            usage=usage,
-            latency_ms=latency_ms,
-            finish_reason=data.get("choices", [{}])[0].get("finish_reason", "stop"),
-            success=True,
-        )
-
+                response.raise_for_status()
+                data = response.json()
+                content = data["choices"][0]["message"]["content"]
+                
+                latency = (time.time() - start_time) * 1000
+                self.stats.total_calls += 1
+                self.stats.success_calls += 1
+                self.stats.total_latency_ms += latency
+                self.stats.last_call_time = time.time()
+                
+                return content
+                
+            except httpx.TimeoutException as e:
+                last_error = f"请求超时: {str(e)}"
+                self.stats.last_error = last_error
+            except httpx.HTTPStatusError as e:
+                if e.response.status_code == 429:
+                    wait = RETRY_DELAYS[min(attempt, len(RETRY_DELAYS) - 1)] * 2
+                    last_error = f"速率限制，等待{wait}秒后重试"
+                    self.stats.last_error = last_error
+                    await asyncio.sleep(wait)
+                    continue
+                elif e.response.status_code >= 500:
+                    last_error = f"服务端错误: {e.response.status_code}"
+                    self.stats.last_error = last_error
+                else:
+                    last_error = f"HTTP错误: {e.response.status_code}"
+                    self.stats.last_error = last_error
+                    break
+            except Exception as e:
+                last_error = f"请求异常: {str(e)}"
+                self.stats.last_error = last_error
+            
+            if attempt < MAX_RETRIES - 1:
+                await asyncio.sleep(RETRY_DELAYS[attempt])
+        
+        self.stats.total_calls += 1
+        self.stats.failed_calls += 1
+        raise RuntimeError(f"DeepSeek调用失败(重试{MAX_RETRIES}次): {last_error}")
+    
     async def chat_stream(
         self,
-        messages: list[ChatMessage],
-        temperature: Optional[float] = None,
-    ) -> AsyncIterator[str]:
-        """流式聊天接口"""
-        try:
-            client = self._get_client()
-            if client is not None:
-                from langchain_core.messages import HumanMessage, SystemMessage, AIMessage
-
-                lc_messages = []
-                for msg in messages:
-                    if msg.role == "system":
-                        lc_messages.append(SystemMessage(content=msg.content))
-                    elif msg.role == "assistant":
-                        lc_messages.append(AIMessage(content=msg.content))
-                    else:
-                        lc_messages.append(HumanMessage(content=msg.content))
-
-                client.streaming = True
-                if temperature is not None:
-                    client.temperature = temperature
-
-                async for chunk in client.astream(lc_messages):
-                    yield chunk.content
-            else:
-                import httpx
-
-                url = f"{self.config.base_url}/chat/completions"
-                headers = {
-                    "Authorization": f"Bearer {self.config.api_key}",
-                    "Content-Type": "application/json",
-                }
-                payload = {
-                    "model": self.config.model,
-                    "messages": [{"role": m.role, "content": m.content} for m in messages],
-                    "temperature": temperature or self.config.temperature,
-                    "stream": True,
-                }
-
-                async with httpx.AsyncClient(timeout=self.config.timeout_seconds) as http_client:
-                    async with http_client.stream("POST", url, json=payload, headers=headers) as resp:
-                        async for line in resp.aiter_lines():
-                            if line.startswith("data: "):
-                                data_str = line[6:]
-                                if data_str.strip() == "[DONE]":
-                                    break
-                                import json
-                                try:
-                                    data = json.loads(data_str)
-                                    delta = data.get("choices", [{}])[0].get("delta", {})
-                                    content = delta.get("content", "")
-                                    if content:
-                                        yield content
-                                except json.JSONDecodeError:
-                                    continue
-        except Exception as e:
-            logger.error(f"DeepSeek流式调用失败: {e}")
-            yield f"[错误] {str(e)}"
-
-    async def parse_intent(self, user_input: str) -> dict[str, Any]:
-        """意图解析专用接口"""
-        messages = [
-            ChatMessage(
-                role="system",
-                content=(
-                    "你是一个网络运维意图解析专家。请将用户的自然语言输入解析为结构化意图。"
-                    "输出JSON格式，包含：intent_type（意图类型）、target（目标对象）、"
-                    "action（动作）、parameters（参数字典）、confidence（置信度0-1）。"
-                ),
-            ),
-            ChatMessage(role="user", content=user_input),
-        ]
-        response = await self.chat(messages, temperature=0.3)
-        if response.success:
-            import json
+        messages: List[DeepSeekMessage],
+        temperature: float = 0.7,
+        max_tokens: int = 2048
+    ) -> AsyncGenerator[str, None]:
+        if not self.available:
+            raise ValueError("DeepSeek API Key 未配置")
+        
+        messages = self._trim_context(messages)
+        payload = self._build_payload(messages, temperature, max_tokens, stream=True)
+        
+        last_error = None
+        for attempt in range(MAX_RETRIES):
+            start_time = time.time()
             try:
-                return json.loads(response.content)
-            except json.JSONDecodeError:
-                return {"raw_response": response.content, "parse_error": True}
-        return {"error": response.error, "success": False}
-
-    async def enhance_dialogue(self, context: str, user_input: str) -> str:
-        """对话增强专用接口"""
-        messages = [
-            ChatMessage(
-                role="system",
-                content=(
-                    "你是一个网络运维助手，擅长用专业但易懂的语言回答网络运维问题。"
-                    "请基于上下文和用户输入，提供准确、有用的回答。"
-                ),
-            ),
-            ChatMessage(role="user", content=f"上下文：{context}\n\n用户问题：{user_input}"),
-        ]
-        response = await self.chat(messages)
-        return response.content if response.success else f"[错误] {response.error}"
-
-    async def generate_config(self, intent: dict[str, Any], device_info: dict[str, Any]) -> str:
-        """配置生成专用接口"""
-        messages = [
-            ChatMessage(
-                role="system",
-                content=(
-                    "你是一个网络设备配置生成专家。根据意图和设备信息，"
-                    "生成标准化的网络设备配置命令。只输出配置命令，不要解释。"
-                ),
-            ),
-            ChatMessage(
-                role="user",
-                content=f"意图：{intent}\n设备信息：{device_info}",
-            ),
-        ]
-        response = await self.chat(messages, temperature=0.2)
-        return response.content if response.success else f"[错误] {response.error}"
-
-    def get_stats(self) -> dict[str, Any]:
-        """获取服务统计"""
+                client = await self._get_client()
+                async with client.stream(
+                    "POST",
+                    self.api_url,
+                    headers=self._build_headers(),
+                    json=payload
+                ) as response:
+                    response.raise_for_status()
+                    async for line in response.aiter_lines():
+                        if line.startswith("data: "):
+                            data_str = line[6:]
+                            if data_str.strip() == "[DONE]":
+                                break
+                            try:
+                                data = json.loads(data_str)
+                                delta = data.get("choices", [{}])[0].get("delta", {})
+                                content = delta.get("content", "")
+                                if content:
+                                    yield content
+                            except json.JSONDecodeError:
+                                continue
+                
+                latency = (time.time() - start_time) * 1000
+                self.stats.total_calls += 1
+                self.stats.success_calls += 1
+                self.stats.total_latency_ms += latency
+                self.stats.last_call_time = time.time()
+                return
+                
+            except httpx.TimeoutException as e:
+                last_error = f"流式请求超时: {str(e)}"
+                self.stats.last_error = last_error
+            except httpx.HTTPStatusError as e:
+                if e.response.status_code == 429:
+                    wait = RETRY_DELAYS[min(attempt, len(RETRY_DELAYS) - 1)] * 2
+                    last_error = f"流式请求速率限制，等待{wait}秒后重试"
+                    self.stats.last_error = last_error
+                    await asyncio.sleep(wait)
+                    continue
+                elif e.response.status_code >= 500:
+                    last_error = f"流式请求服务端错误: {e.response.status_code}"
+                    self.stats.last_error = last_error
+                else:
+                    last_error = f"流式请求HTTP错误: {e.response.status_code}"
+                    self.stats.last_error = last_error
+                    break
+            except httpx.ConnectError as e:
+                last_error = f"连接失败: {str(e)}"
+                self.stats.last_error = last_error
+            except Exception as e:
+                last_error = f"流式请求异常: {str(e)}"
+                self.stats.last_error = last_error
+            
+            if attempt < MAX_RETRIES - 1:
+                await asyncio.sleep(RETRY_DELAYS[attempt])
+        
+        self.stats.total_calls += 1
+        self.stats.failed_calls += 1
+        raise RuntimeError(f"DeepSeek流式调用失败(重试{MAX_RETRIES}次): {last_error}")
+    
+    def get_stats(self) -> Dict[str, Any]:
+        avg_latency = (
+            self.stats.total_latency_ms / self.stats.success_calls
+            if self.stats.success_calls > 0
+            else 0
+        )
         return {
-            **self._stats,
-            "model": self.config.model,
-            "success_rate": (
-                self._stats["success_calls"] / max(self._stats["total_calls"], 1)
-            ),
+            "available": self.available,
+            "model": self.model,
+            "total_calls": self.stats.total_calls,
+            "success_calls": self.stats.success_calls,
+            "failed_calls": self.stats.failed_calls,
+            "avg_latency_ms": round(avg_latency, 1),
+            "last_call_time": self.stats.last_call_time,
+            "last_error": self.stats.last_error
         }
 
-    async def process(self, input_data: dict[str, Any]) -> dict[str, Any]:
-        """Agent标准处理接口"""
-        action = input_data.get("action", "chat")
-        if action == "parse_intent":
-            result = await self.parse_intent(input_data.get("user_input", ""))
-            return {"action": "parse_intent", "result": result}
-        elif action == "enhance_dialogue":
-            result = await self.enhance_dialogue(
-                input_data.get("context", ""),
-                input_data.get("user_input", ""),
-            )
-            return {"action": "enhance_dialogue", "result": result}
-        elif action == "generate_config":
-            result = await self.generate_config(
-                input_data.get("intent", {}),
-                input_data.get("device_info", {}),
-            )
-            return {"action": "generate_config", "result": result}
-        else:
-            messages = [
-                ChatMessage(role=m["role"], content=m["content"])
-                for m in input_data.get("messages", [])
-            ]
-            response = await self.chat(messages)
-            return {
-                "action": "chat",
-                "content": response.content,
-                "success": response.success,
-                "error": response.error,
-            }
+_deepseek_instance: Optional[DeepSeekService] = None
+_instance_lock = asyncio.Lock() if hasattr(asyncio, 'Lock') else None
 
-    async def health_check(self) -> dict[str, Any]:
-        """健康检查"""
-        try:
-            test_msg = [ChatMessage(role="user", content="ping")]
-            response = await self.chat(test_msg, max_tokens=10)
-            return {
-                "status": "healthy" if response.success else "unhealthy",
-                "model": self.config.model,
-                "latency_ms": response.latency_ms,
-                "stats": self._stats,
-            }
-        except Exception as e:
-            return {
-                "status": "unhealthy",
-                "model": self.config.model,
-                "error": str(e),
-            }
+
+def get_deepseek_service() -> DeepSeekService:
+    global _deepseek_instance
+    if _deepseek_instance is None:
+        _deepseek_instance = DeepSeekService()
+    return _deepseek_instance

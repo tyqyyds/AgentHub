@@ -1,76 +1,77 @@
-import { ref, computed, onMounted, onUnmounted } from 'vue'
+import { ref, computed, onUnmounted } from 'vue'
 
-type BreakpointName = 'xs' | 'sm' | 'md' | 'lg' | 'xl'
-
-interface BreakpointConfig {
-  name: BreakpointName
-  query: string
-}
-
-const BREAKPOINTS: BreakpointConfig[] = [
-  { name: 'xs', query: '(max-width: 575.98px)' },
-  { name: 'sm', query: '(min-width: 576px) and (max-width: 767.98px)' },
-  { name: 'md', query: '(min-width: 768px) and (max-width: 991.98px)' },
-  { name: 'lg', query: '(min-width: 992px) and (max-width: 1199.98px)' },
-  { name: 'xl', query: '(min-width: 1200px)' }
-]
+export const BREAKPOINTS = {
+  XS: 480,
+  SM: 640,
+  MD: 768,
+  LG: 1024,
+  XL: 1200,
+  XXL: 1600
+} as const
 
 export function useResponsive() {
-  const breakpoints = ref<Record<BreakpointName, boolean>>({
-    xs: false,
-    sm: false,
-    md: false,
-    lg: false,
-    xl: false
-  })
+  const width = ref(window.innerWidth)
+  const height = ref(window.innerHeight)
 
-  const currentBreakpoint = ref<BreakpointName>('lg')
+  let timer: ReturnType<typeof setTimeout> | null = null
 
-  const mediaQueryLists: MediaQueryList[] = []
-  const handlers: Array<() => void> = []
-
-  function updateBreakpoints(): void {
-    for (const bp of BREAKPOINTS) {
-      const mql = window.matchMedia(bp.query)
-      breakpoints.value[bp.name] = mql.matches
-      if (mql.matches) {
-        currentBreakpoint.value = bp.name
-      }
-    }
+  const update = () => {
+    width.value = window.innerWidth
+    height.value = window.innerHeight
   }
 
-  const isMobile = computed(() => breakpoints.value.xs || breakpoints.value.sm)
-  const isTablet = computed(() => breakpoints.value.md)
-  const isDesktop = computed(() => breakpoints.value.lg || breakpoints.value.xl)
+  const debouncedUpdate = () => {
+    if (timer) clearTimeout(timer)
+    timer = setTimeout(update, 150)
+  }
 
-  onMounted(() => {
-    updateBreakpoints()
+  const mediaQueries = [
+    window.matchMedia(`(max-width: ${BREAKPOINTS.XS}px)`),
+    window.matchMedia(`(max-width: ${BREAKPOINTS.SM}px)`),
+    window.matchMedia(`(max-width: ${BREAKPOINTS.MD}px)`),
+    window.matchMedia(`(max-width: ${BREAKPOINTS.LG}px)`),
+    window.matchMedia(`(max-width: ${BREAKPOINTS.XL}px)`),
+    window.matchMedia(`(max-width: ${BREAKPOINTS.XXL}px)`)
+  ]
 
-    for (const bp of BREAKPOINTS) {
-      const mql = window.matchMedia(bp.query)
-      const handler = () => {
-        breakpoints.value[bp.name] = mql.matches
-        if (mql.matches) {
-          currentBreakpoint.value = bp.name
-        }
-      }
-      mql.addEventListener('change', handler)
-      mediaQueryLists.push(mql)
-      handlers.push(handler)
-    }
+  const handleMediaChange = () => update()
+
+  window.addEventListener('resize', debouncedUpdate)
+  mediaQueries.forEach(mq => {
+    mq.addEventListener('change', handleMediaChange)
   })
 
   onUnmounted(() => {
-    for (let i = 0; i < mediaQueryLists.length; i++) {
-      mediaQueryLists[i].removeEventListener('change', handlers[i])
-    }
+    if (timer) clearTimeout(timer)
+    window.removeEventListener('resize', debouncedUpdate)
+    mediaQueries.forEach(mq => {
+      mq.removeEventListener('change', handleMediaChange)
+    })
   })
 
+  const isXs = computed(() => width.value <= BREAKPOINTS.XS)
+  const isSm = computed(() => width.value <= BREAKPOINTS.SM)
+  const isMobile = computed(() => width.value <= BREAKPOINTS.MD)
+  const isTablet = computed(() => width.value > BREAKPOINTS.MD && width.value <= BREAKPOINTS.LG)
+  const isDesktop = computed(() => width.value > BREAKPOINTS.LG)
+  const isLargeDesktop = computed(() => width.value >= BREAKPOINTS.XL)
+  const orientation = computed<'portrait' | 'landscape'>(() =>
+    width.value >= height.value ? 'landscape' : 'portrait'
+  )
+  const isTouchDevice = computed(
+    () => window.matchMedia('(pointer: coarse)').matches || ('ontouchstart' in window && navigator.maxTouchPoints > 0)
+  )
+
   return {
-    breakpoints,
-    currentBreakpoint,
+    width,
+    height,
+    isXs,
+    isSm,
     isMobile,
     isTablet,
-    isDesktop
+    isDesktop,
+    isLargeDesktop,
+    orientation,
+    isTouchDevice
   }
 }

@@ -1,83 +1,115 @@
 from fastapi import APIRouter, Depends, HTTPException
-from sqlalchemy.ext.asyncio import AsyncSession
-from sqlalchemy import select
-from pydantic import BaseModel
-from typing import Optional, List
-from ..database.connection import get_db_session
-from ..database.models import Intent, WizardSession
-from .deps import get_current_user
+from pydantic import BaseModel, Field
+from typing import Optional, List, Dict, Any
+from backend.core.security.rbac import get_current_user
+from backend.agents.clarification import get_clarification_agent
+from backend.agents.intent_parser import IntentParserAgent
+from backend.api.response import success_response
+import logging
+
+logger = logging.getLogger(__name__)
 
 router = APIRouter()
 
-
-class ClarificationRequest(BaseModel):
-    intent_id: int
-    question: str
-    options: Optional[List[str]] = None
+_intent_parser = IntentParserAgent()
 
 
-class ClarificationResponse(BaseModel):
-    intent_id: int
-    answer: str
-    selected_option: Optional[str] = None
+class AnalyzeRequest(BaseModel):
+    user_input: str = Field(..., min_length=1, max_length=2000)
 
 
-@router.post("/ask")
-async def ask_clarification(
-    req: ClarificationRequest,
-    db: AsyncSession = Depends(get_db_session),
-    current_user=Depends(get_current_user),
-):
-    result = await db.execute(select(Intent).where(Intent.id == req.intent_id))
-    intent = result.scalar_one_or_none()
-    if not intent:
-        raise HTTPException(status_code=404, detail="Intent not found")
-
-    return {"status": "success", "data": {"intent_id": req.intent_id, "question": req.question, "options": req.options, "session_active": True}}
+class RespondRequest(BaseModel):
+    session_id: str = Field(..., min_length=1)
+    user_response: str = Field(..., min_length=1, max_length=2000)
 
 
-@router.post("/answer")
-async def submit_clarification(
-    req: ClarificationResponse,
-    db: AsyncSession = Depends(get_db_session),
-    current_user=Depends(get_current_user),
-):
-    result = await db.execute(select(Intent).where(Intent.id == req.intent_id))
-    intent = result.scalar_one_or_none()
-    if not intent:
-        raise HTTPException(status_code=404, detail="Intent not found")
+@router.post("/analyze")
+async def analyze_input(request: AnalyzeRequest, current_user=Depends(get_current_user)):
+    try:
+        result = await _intent_parser.parse_with_clarification(request.user_input)
 
-    return {"status": "success", "data": {"intent_id": req.intent_id, "answer_received": True, "clarification_complete": True}}
+        from backend.agents.clarification import ClarificationResult
+        from backend.agents.base import IntentContext
+
+        if isinstance(result, IntentContext):
+            return success_response(data={
+                "needs_clarification": False,
+                "confidence": 1.0,
+                "questions": [],
+                "session_id": None,
+                "parsed_intent": result.parsed_intent
+            })
+
+        if isinstance(result, ClarificationResult):
+            return success_response(data={
+                "needs_clarification": result.needs_clarification,
+                "confidence": result.confidence,
+                "questions": result.questions,
+                "session_id": result.session_id,
+                "missing_fields": result.missing_fields
+            })
+
+        return success_response(data={
+            "needs_clarification": True,
+            "confidence": 0.0,
+            "questions": ["无法解析您的意图，请更详细地描述您的需求"],
+            "session_id": None
+        })
+    except Exception as e:
+        logger.error(f"Clarification analyze error: {e}", exc_info=True)
+        raise HTTPException(status_code=500, detail="意图分析失败，请稍后重试")
 
 
-@router.get("/wizard/{session_id}")
-async def get_wizard_session(
-    session_id: int,
-    db: AsyncSession = Depends(get_db_session),
-    current_user=Depends(get_current_user),
-):
-    result = await db.execute(select(WizardSession).where(WizardSession.id == session_id))
-    session = result.scalar_one_or_none()
+@router.post("/respond")
+async def respond_clarification(request: RespondRequest, current_user=Depends(get_current_user)):
+    try:
+        result = await _intent_parser.resolve_and_parse(request.session_id, request.user_response)
+
+        from backend.agents.clarification import ClarificationResult
+        from backend.agents.base import IntentContext
+
+        if isinstance(result, IntentContext):
+            return success_response(data={
+                "resolved": True,
+                "parsed_intent": result.parsed_intent,
+                "needs_more_clarification": False,
+                "questions": []
+            })
+
+        if isinstance(result, ClarificationResult):
+            return success_response(data={
+                "resolved": False,
+                "parsed_intent": None,
+                "needs_more_clarification": result.needs_clarification,
+                "questions": result.questions,
+                "missing_fields": result.missing_fields,
+                "session_id": result.session_id
+            })
+
+        return success_response(data={
+            "resolved": False,
+            "parsed_intent": None,
+            "needs_more_clarification": True,
+            "questions": ["请继续提供更多信息"]
+        })
+    except Exception as e:
+        logger.error(f"Clarification respond error: {e}", exc_info=True)
+        raise HTTPException(status_code=500, detail=f"澄清响应处理失败: {str(e)}")
+
+
+@router.get("/session/{session_id}")
+async def get_session_status(session_id: str, current_user=Depends(get_current_user)):
+    clarification_agent = get_clarification_agent()
+    session = clarification_agent.get_session(session_id)
     if not session:
-        raise HTTPException(status_code=404, detail="Wizard session not found")
-    return {"status": "success", "data": {"id": session.id, "current_step": session.current_step, "total_steps": session.total_steps, "wizard_data": session.wizard_data}}
+        raise HTTPException(status_code=404, detail="澄清会话不存在或已过期")
+    return success_response(data=session)
 
 
-@router.post("/wizard/{session_id}/next")
-async def wizard_next_step(
-    session_id: int,
-    step_data: dict,
-    db: AsyncSession = Depends(get_db_session),
-    current_user=Depends(get_current_user),
-):
-    result = await db.execute(select(WizardSession).where(WizardSession.id == session_id))
-    session = result.scalar_one_or_none()
-    if not session:
-        raise HTTPException(status_code=404, detail="Wizard session not found")
-    session.current_step = min(session.current_step + 1, session.total_steps)
-    if session.wizard_data:
-        session.wizard_data.update(step_data)
-    else:
-        session.wizard_data = step_data
-    await db.commit()
-    return {"status": "success", "data": {"current_step": session.current_step, "total_steps": session.total_steps}}
+@router.delete("/session/{session_id}")
+async def cancel_clarification_session(session_id: str, current_user=Depends(get_current_user)):
+    clarification_agent = get_clarification_agent()
+    cancelled = clarification_agent.cancel_session(session_id)
+    if not cancelled:
+        raise HTTPException(status_code=404, detail="澄清会话不存在或已过期")
+    return success_response(message="澄清会话已取消")

@@ -1,180 +1,205 @@
 from fastapi import APIRouter, Depends, HTTPException, Query
-from sqlalchemy.ext.asyncio import AsyncSession
 from sqlalchemy import select
-from pydantic import BaseModel
-from typing import Optional, List
-from ..database.connection import get_db_session
-from ..database.models import Device, DeviceLink, DeviceVendor, DeviceType, DeviceStatus, LinkType, LinkStatus
-from .deps import get_current_user
+from sqlalchemy.ext.asyncio import AsyncSession
+import asyncio
+from backend.database.connection import get_db_session
+from backend.database.models import Device, DeviceLink
+from backend.core.security.rbac import get_current_user
+from backend.map.topology_map_fusion import get_topology_map_fusion
+from backend.api.response import success_response
 
 router = APIRouter()
 
+DEFAULT_DEVICES = [
+    {"device_id": "central", "name": "核心交换机", "device_type": "core", "vendor": "huawei", "ip_address": "10.0.0.1", "status": "healthy", "cpu_usage": 35.2, "memory_usage": 42.1},
+    {"device_id": "core1", "name": "核心路由器-1", "device_type": "core", "vendor": "cisco", "ip_address": "10.0.0.2", "status": "healthy", "cpu_usage": 28.5, "memory_usage": 38.7},
+    {"device_id": "core2", "name": "核心路由器-2", "device_type": "core", "vendor": "cisco", "ip_address": "10.0.0.3", "status": "healthy", "cpu_usage": 31.8, "memory_usage": 45.3},
+    {"device_id": "agg1", "name": "汇聚交换机-1", "device_type": "aggregation", "vendor": "huawei", "ip_address": "10.0.1.1", "status": "healthy", "cpu_usage": 22.1, "memory_usage": 30.5},
+    {"device_id": "agg2", "name": "汇聚交换机-2", "device_type": "aggregation", "vendor": "huawei", "ip_address": "10.0.1.2", "status": "healthy", "cpu_usage": 25.4, "memory_usage": 33.2},
+    {"device_id": "agg3", "name": "汇聚交换机-3", "device_type": "aggregation", "vendor": "h3c", "ip_address": "10.0.1.3", "status": "warning", "cpu_usage": 78.9, "memory_usage": 72.1},
+    {"device_id": "acc1", "name": "接入交换机-1", "device_type": "access", "vendor": "huawei", "ip_address": "10.0.2.1", "status": "healthy", "cpu_usage": 15.3, "memory_usage": 22.8},
+    {"device_id": "acc2", "name": "接入交换机-2", "device_type": "access", "vendor": "h3c", "ip_address": "10.0.2.2", "status": "warning", "cpu_usage": 68.2, "memory_usage": 55.4},
+    {"device_id": "acc3", "name": "接入交换机-3", "device_type": "access", "vendor": "huawei", "ip_address": "10.0.2.3", "status": "healthy", "cpu_usage": 18.7, "memory_usage": 25.1},
+    {"device_id": "acc4", "name": "接入交换机-4", "device_type": "access", "vendor": "h3c", "ip_address": "10.0.2.4", "status": "error", "cpu_usage": 95.1, "memory_usage": 88.3},
+]
 
-class DeviceCreate(BaseModel):
-    name: str
-    ip: str
-    vendor: str
-    device_type: str
-    location: Optional[str] = None
-    snmp_community: Optional[str] = None
-    ssh_port: int = 22
+DEFAULT_LINKS = [
+    {"source_device_id": "central", "target_device_id": "core1", "status": "active", "bandwidth": "40G", "current_load": 65.0, "latency": 1.2},
+    {"source_device_id": "central", "target_device_id": "core2", "status": "active", "bandwidth": "40G", "current_load": 58.0, "latency": 1.5},
+    {"source_device_id": "core1", "target_device_id": "core2", "status": "active", "bandwidth": "10G", "current_load": 82.0, "latency": 2.1},
+    {"source_device_id": "core1", "target_device_id": "agg1", "status": "active", "bandwidth": "10G", "current_load": 31.0, "latency": 3.5},
+    {"source_device_id": "core1", "target_device_id": "agg2", "status": "active", "bandwidth": "10G", "current_load": 45.0, "latency": 4.2},
+    {"source_device_id": "core2", "target_device_id": "agg2", "status": "active", "bandwidth": "10G", "current_load": 28.0, "latency": 3.8},
+    {"source_device_id": "core2", "target_device_id": "agg3", "status": "warning", "bandwidth": "10G", "current_load": 75.0, "latency": 8.5},
+    {"source_device_id": "agg1", "target_device_id": "acc1", "status": "active", "bandwidth": "1G", "current_load": 45.0, "latency": 5.3},
+    {"source_device_id": "agg1", "target_device_id": "acc2", "status": "active", "bandwidth": "1G", "current_load": 68.0, "latency": 6.8},
+    {"source_device_id": "agg2", "target_device_id": "acc2", "status": "active", "bandwidth": "1G", "current_load": 52.0, "latency": 5.9},
+    {"source_device_id": "agg2", "target_device_id": "acc3", "status": "active", "bandwidth": "1G", "current_load": 38.0, "latency": 4.7},
+    {"source_device_id": "agg3", "target_device_id": "acc3", "status": "active", "bandwidth": "1G", "current_load": 41.0, "latency": 7.2},
+    {"source_device_id": "agg3", "target_device_id": "acc4", "status": "error", "bandwidth": "1G", "current_load": 95.0, "latency": 25.6},
+]
 
 
-class DeviceUpdate(BaseModel):
-    name: Optional[str] = None
-    ip: Optional[str] = None
-    status: Optional[str] = None
-    location: Optional[str] = None
+_default_data_initialized = False
+_default_data_lock = asyncio.Lock()
+
+async def ensure_default_data(db: AsyncSession):
+    global _default_data_initialized
+    if _default_data_initialized:
+        return
+    async with _default_data_lock:
+        if _default_data_initialized:
+            return
+        result = await db.execute(select(Device).limit(1))
+        if result.scalars().first():
+            _default_data_initialized = True
+            return
+        for d in DEFAULT_DEVICES:
+            db.add(Device(**d))
+        for l in DEFAULT_LINKS:
+            db.add(DeviceLink(**l))
+        await db.commit()
+        _default_data_initialized = True
 
 
-class LinkCreate(BaseModel):
-    source_device_id: int
-    target_device_id: int
-    link_type: str
-    bandwidth: Optional[str] = None
-    latency_ms: Optional[float] = None
+@router.get("")
+async def get_topology(db: AsyncSession = Depends(get_db_session), current_user=Depends(get_current_user)):
+    await ensure_default_data(db)
+
+    devices_result = await db.execute(select(Device))
+    devices = devices_result.scalars().all()
+
+    links_result = await db.execute(select(DeviceLink))
+    links = links_result.scalars().all()
+
+    nodes = []
+    for d in devices:
+        nodes.append({
+            "id": d.device_id,
+            "name": d.name,
+            "type": d.device_type,
+            "status": d.status,
+            "ip": d.ip_address,
+            "vendor": d.vendor,
+            "cpu_usage": d.cpu_usage,
+            "memory_usage": d.memory_usage,
+            "uptime": d.uptime,
+            "location": d.location,
+        })
+
+    link_list = []
+    for l in links:
+        link_list.append({
+            "source": l.source_device_id,
+            "target": l.target_device_id,
+            "status": l.status,
+            "bandwidth": l.bandwidth,
+            "currentLoad": l.current_load,
+            "latency": l.latency,
+            "link_type": l.link_type,
+        })
+
+    return {
+        "status": "success",
+        "data": {
+            "nodes": nodes,
+            "links": link_list
+        }
+    }
 
 
 @router.get("/devices")
-async def list_devices(
-    vendor: Optional[str] = Query(None),
-    device_type: Optional[str] = Query(None),
-    status: Optional[str] = Query(None),
-    skip: int = Query(0, ge=0),
-    limit: int = Query(50, ge=1, le=200),
-    db: AsyncSession = Depends(get_db_session),
-    current_user=Depends(get_current_user),
-):
-    query = select(Device)
-    if vendor:
-        try:
-            query = query.where(Device.vendor == DeviceVendor(vendor))
-        except ValueError:
-            pass
-    if device_type:
-        try:
-            query = query.where(Device.device_type == DeviceType(device_type))
-        except ValueError:
-            pass
-    if status:
-        try:
-            query = query.where(Device.status == DeviceStatus(status))
-        except ValueError:
-            pass
-    query = query.offset(skip).limit(limit)
-    result = await db.execute(query)
+async def get_devices(db: AsyncSession = Depends(get_db_session), current_user=Depends(get_current_user)):
+    await ensure_default_data(db)
+    result = await db.execute(select(Device))
     devices = result.scalars().all()
-    return {"status": "success", "data": [{"id": d.id, "name": d.name, "ip": d.ip, "vendor": d.vendor.value, "device_type": d.device_type.value, "status": d.status.value, "location": d.location} for d in devices]}
+    return {
+        "status": "success",
+        "data": [{
+            "id": d.device_id,
+            "name": d.name,
+            "type": d.device_type,
+            "vendor": d.vendor,
+            "ip": d.ip_address,
+            "status": d.status,
+            "cpu_usage": d.cpu_usage,
+            "memory_usage": d.memory_usage,
+            "os_type": d.os_type,
+            "ssh_port": d.ssh_port,
+            "netconf_port": d.netconf_port,
+            "uptime": d.uptime,
+            "location": d.location,
+        } for d in devices]
+    }
 
 
 @router.get("/devices/{device_id}")
-async def get_device(
-    device_id: int,
-    db: AsyncSession = Depends(get_db_session),
-    current_user=Depends(get_current_user),
-):
-    result = await db.execute(select(Device).where(Device.id == device_id))
-    device = result.scalar_one_or_none()
+async def get_device(device_id: str, db: AsyncSession = Depends(get_db_session), current_user=Depends(get_current_user)):
+    result = await db.execute(select(Device).where(Device.device_id == device_id))
+    device = result.scalars().first()
     if not device:
         raise HTTPException(status_code=404, detail="Device not found")
-    return {"status": "success", "data": {"id": device.id, "name": device.name, "ip": device.ip, "vendor": device.vendor.value, "device_type": device.device_type.value, "status": device.status.value, "location": device.location, "ssh_port": device.ssh_port}}
-
-
-@router.post("/devices")
-async def create_device(
-    req: DeviceCreate,
-    db: AsyncSession = Depends(get_db_session),
-    current_user=Depends(get_current_user),
-):
-    try:
-        vendor = DeviceVendor(req.vendor)
-        dtype = DeviceType(req.device_type)
-    except ValueError as e:
-        raise HTTPException(status_code=400, detail=str(e))
-    device = Device(name=req.name, ip=req.ip, vendor=vendor, device_type=dtype, location=req.location, snmp_community=req.snmp_community, ssh_port=req.ssh_port)
-    db.add(device)
-    await db.commit()
-    await db.refresh(device)
-    return {"status": "success", "data": {"id": device.id}}
-
-
-@router.put("/devices/{device_id}")
-async def update_device(
-    device_id: int,
-    req: DeviceUpdate,
-    db: AsyncSession = Depends(get_db_session),
-    current_user=Depends(get_current_user),
-):
-    result = await db.execute(select(Device).where(Device.id == device_id))
-    device = result.scalar_one_or_none()
-    if not device:
-        raise HTTPException(status_code=404, detail="Device not found")
-    if req.name is not None:
-        device.name = req.name
-    if req.ip is not None:
-        device.ip = req.ip
-    if req.status is not None:
-        try:
-            device.status = DeviceStatus(req.status)
-        except ValueError:
-            raise HTTPException(status_code=400, detail="Invalid status")
-    if req.location is not None:
-        device.location = req.location
-    await db.commit()
-    return {"status": "success"}
-
-
-@router.delete("/devices/{device_id}")
-async def delete_device(
-    device_id: int,
-    db: AsyncSession = Depends(get_db_session),
-    current_user=Depends(get_current_user),
-):
-    result = await db.execute(select(Device).where(Device.id == device_id))
-    device = result.scalar_one_or_none()
-    if not device:
-        raise HTTPException(status_code=404, detail="Device not found")
-    await db.delete(device)
-    await db.commit()
-    return {"status": "success"}
+    return {
+        "status": "success",
+        "data": {
+            "id": device.device_id,
+            "name": device.name,
+            "type": device.device_type,
+            "vendor": device.vendor,
+            "ip": device.ip_address,
+            "status": device.status,
+            "cpu_usage": device.cpu_usage,
+            "memory_usage": device.memory_usage,
+            "os_type": device.os_type,
+            "ssh_port": device.ssh_port,
+            "netconf_port": device.netconf_port,
+            "uptime": device.uptime,
+            "location": device.location,
+        }
+    }
 
 
 @router.get("/links")
-async def list_links(
+async def get_link_status_overlay(
     db: AsyncSession = Depends(get_db_session),
-    current_user=Depends(get_current_user),
+    current_user=Depends(get_current_user)
 ):
-    result = await db.execute(select(DeviceLink))
-    links = result.scalars().all()
-    return {"status": "success", "data": [{"id": l.id, "source_device_id": l.source_device_id, "target_device_id": l.target_device_id, "link_type": l.link_type.value, "bandwidth": l.bandwidth, "status": l.status.value, "latency_ms": l.latency_ms} for l in links]}
+    await ensure_default_data(db)
+    fusion = get_topology_map_fusion()
+    links = await fusion.get_link_status_overlay(db)
+    return success_response(data=links)
 
 
-@router.post("/links")
-async def create_link(
-    req: LinkCreate,
+@router.get("/view")
+async def get_combined_view(
+    view_mode: str = Query("geographic", regex="^(geographic|logical|hybrid)$"),
     db: AsyncSession = Depends(get_db_session),
-    current_user=Depends(get_current_user),
+    current_user=Depends(get_current_user)
 ):
-    try:
-        link_type = LinkType(req.link_type)
-    except ValueError:
-        raise HTTPException(status_code=400, detail="Invalid link type")
-    link = DeviceLink(source_device_id=req.source_device_id, target_device_id=req.target_device_id, link_type=link_type, bandwidth=req.bandwidth, latency_ms=req.latency_ms)
-    db.add(link)
-    await db.commit()
-    await db.refresh(link)
-    return {"status": "success", "data": {"id": link.id}}
+    await ensure_default_data(db)
+    fusion = get_topology_map_fusion()
+    view = await fusion.get_combined_view(db, view_mode=view_mode)
+    return success_response(data=view)
 
 
-@router.get("/graph")
-async def get_topology_graph(
+@router.get("/health")
+async def get_network_health_summary(
     db: AsyncSession = Depends(get_db_session),
-    current_user=Depends(get_current_user),
+    current_user=Depends(get_current_user)
 ):
-    dev_result = await db.execute(select(Device))
-    devices = dev_result.scalars().all()
-    link_result = await db.execute(select(DeviceLink))
-    links = link_result.scalars().all()
-    nodes = [{"id": d.id, "name": d.name, "ip": d.ip, "type": d.device_type.value, "status": d.status.value} for d in devices]
-    edges = [{"source": l.source_device_id, "target": l.target_device_id, "type": l.link_type.value, "status": l.status.value} for l in links]
-    return {"status": "success", "data": {"nodes": nodes, "edges": edges}}
+    await ensure_default_data(db)
+    fusion = get_topology_map_fusion()
+    summary = await fusion.get_network_health_summary(db)
+    return success_response(data=summary)
+
+
+@router.get("/search")
+async def search_devices_on_map(
+    q: str = Query(..., min_length=1),
+    db: AsyncSession = Depends(get_db_session),
+    current_user=Depends(get_current_user)
+):
+    await ensure_default_data(db)
+    fusion = get_topology_map_fusion()
+    results = await fusion.search_devices_on_map(db, q)
+    return success_response(data={"items": results, "total": len(results)})

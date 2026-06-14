@@ -1,0 +1,57 @@
+$breakpoints: (
+  'xs': 480px,
+  'sm': 576px,
+  'md': 768px,
+  'lg': 992px,
+  'xl': 1200px,
+  'xxl': 1600px,
+);
+
+@mixin respond-to($breakpoint) {
+  @if map-has-key($breakpoints, $breakpoint) {
+    @media (max-width: map-get($breakpoints, $breakpoint)) {
+      @content;
+    }
+  }
+}
+
+@mixin respond-above($breakpoint) {
+  @if map-has-key($breakpoints, $breakpoint) {
+    @media (min-width: map-get($breakpoints, $breakpoint) + 1) {
+      @content;
+    }
+  }
+}
+
+.responsive-grid {
+  display: grid;
+  gap: 16px;
+  grid-template-columns: repeat(auto-fill, minmax(320px, 1fr));
+
+  @include respond-to('md') {
+    grid-template-columns: 1fr;
+  }
+}
+
+.responsive-flex {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 16px;
+
+  @include respond-to('sm') {
+    flex-direction: column;
+  }
+}
+
+.hide-on-mobile {
+  @include respond-to('sm') {
+    display: none !important;
+  }
+}
+
+.show-on-mobile {
+  display: none !important;
+  @include respond-to('sm') {
+    display: block !important;
+  }
+}

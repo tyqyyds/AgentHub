@@ -1,0 +1,25 @@
+[
+  {
+    "name": "guizhou_intangible_heritage_sear",
+    "description": "用于查询贵州省内苗族、水族、侗族等非遗项目的详细信息，包括传承人、工艺特点、分布地区和保护状态。用户输入非遗项目名称或关键词，工具返回对应的介绍、历史背景和文化价值。",
+    "args_schema": {
+      "heritage_keyword": "需要查询的贵州非遗项目关键词，如“苗族银饰”“水族马尾绣”",
+      "region_filter": "可选，按地区筛选非遗项目，如“黔东南州”“黔南州”"
+    },
+    "required": [
+      "heritage_keyword"
+    ],
+    "is_custom": true
+  },
+  {
+    "name": "test_tool_1780420523",
+    "description": "自动化测试创建的自定义网络监控工具，用于检测设备连通性",
+    "category": "custom",
+    "args_schema": {
+      "device_name": "目标网络设备的名称标识符",
+      "check_type": "连通性检查的具体类型"
+    },
+    "endpoint": null,
+    "is_custom": true
+  }
+]

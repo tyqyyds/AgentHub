@@ -1,448 +1,297 @@
-"""安全Agent - 6层安全防护：Prompt注入防护→意图扫描→沙箱检测→变更窗口→配置回滚→限流"""
-
-import logging
 import re
-import time
+import ast
+import html
+import urllib.parse
+from typing import Dict, Any, List, Optional, Tuple
 from dataclasses import dataclass, field
+from datetime import datetime
 from enum import Enum
-from typing import Any, Optional
-
-from ..core.config import settings
+import logging
 
 logger = logging.getLogger(__name__)
 
-
-class SecurityLevel(Enum):
-    """安全级别"""
+class ThreatLevel(str, Enum):
     SAFE = "safe"
-    WARNING = "warning"
-    DANGEROUS = "dangerous"
-    BLOCKED = "blocked"
-
-
-class ThreatType(Enum):
-    """威胁类型"""
-    PROMPT_INJECTION = "prompt_injection"
-    MALICIOUS_INTENT = "malicious_intent"
-    DANGEROUS_COMMAND = "dangerous_command"
-    SENSITIVE_OPERATION = "sensitive_operation"
-    RATE_LIMITED = "rate_limited"
-    OUTSIDE_WINDOW = "outside_window"
-    POLICY_VIOLATION = "policy_violation"
-
+    LOW = "low"
+    MEDIUM = "medium"
+    HIGH = "high"
+    CRITICAL = "critical"
 
 @dataclass
-class SecurityCheckResult:
-    """安全检查结果"""
-    level: SecurityLevel
-    threat_type: Optional[ThreatType] = None
-    message: str = ""
-    details: dict[str, Any] = field(default_factory=dict)
-    requires_approval: bool = False
-    blocked: bool = False
-    sanitized_input: Optional[str] = None
+class SecurityScanResult:
+    is_safe: bool
+    threat_level: ThreatLevel
+    threats: List[Dict[str, Any]]
+    sanitized_commands: List[str]
+    scan_time: str
 
-
-@dataclass
-class SecurityConfig:
-    """安全Agent配置"""
-    enable_prompt_injection_detection: bool = True
-    enable_sandbox_detection: bool = True
-    enable_change_window: bool = True
-    enable_rate_limiting: bool = True
-    enable_rollback: bool = True
-    max_requests_per_minute: int = 60
-    max_requests_per_hour: int = 500
-    change_window_start: str = "02:00"
-    change_window_end: str = "06:00"
-    change_window_enabled: bool = False
-    sensitive_commands: list[str] = field(default_factory=lambda: [
-        "erase", "format", "delete", "reload", "reboot",
-        "shutdown", "factory-reset", "restore",
-    ])
-
-
-# Prompt注入检测模式（58种）
-PROMPT_INJECTION_PATTERNS = [
-    re.compile(p, re.IGNORECASE) for p in [
-        r"ignore\s+(previous|above|all|prior)\s+(instructions|prompts|rules)",
-        r"forget\s+(everything|all|previous|prior)",
-        r"you\s+are\s+now\s+",
-        r"pretend\s+(you\s+are|to\s+be)",
-        r"act\s+as\s+(if\s+you\s+are|a|an)",
-        r"disregard\s+(all|any|previous|safety)",
-        r"override\s+(safety|security|previous)",
-        r"bypass\s+(security|safety|restrictions|filters)",
-        r"system\s*:\s*",
-        r"<\|im_start\|>",
-        r"\[INST\]",
-        r"###\s*Instruction",
-        r"jailbreak",
-        r"DAN\s+mode",
-        r"developer\s+mode",
-        r"sudo\s+rm",
-        r"rm\s+-rf\s+/",
-        r";\s*rm\s+",
-        r"\|\s*rm\s+",
-        r"\$\(",
-        r"`[^`]*`",
-        r"\\x[0-9a-fA-F]{2}",
-        r"\\u[0-9a-fA-F]{4}",
-        r"0x[0-9a-fA-F]+",
-        r"eval\s*\(",
-        r"exec\s*\(",
-        r"subprocess",
-        r"os\.system",
-        r"import\s+os",
-        r"__import__",
-        r"__class__",
-        r"__subclasses__",
-        r"__globals__",
-        r"__builtins__",
-        r"base64\.b64decode",
-        r"pickle\.loads",
-        r"yaml\.load\s*\(",
-        r"marshal\.loads",
-        r"shelve\.open",
-        r"webbrowser\.open",
-        r"socket\.socket",
-        r"requests\.(post|put|delete|patch)",
-        r"urllib\.request",
-        r"http\.client",
-        r"paramiko",
-        r"fabric",
-        r"ansible",
-        r"terraform\s+(apply|destroy)",
-        r"kubectl\s+(delete|exec)",
-        r"docker\s+(rm|exec|rmi)",
-        r"crontab",
-        r"nohup",
-        r"chmod\s+777",
-        r"chown\s+root",
-        r"iptables\s+-F",
-        r"setenforce\s+0",
-        r"systemctl\s+(stop|disable)\s+(firewall|ssh)",
+class SecuritySandbox:
+    DANGEROUS_COMMANDS = [
+        (r"delete\s+system", "CRITICAL", "删除系统文件"),
+        (r"erase\s+flash:", "CRITICAL", "擦除闪存"),
+        (r"format\s+disk", "CRITICAL", "格式化磁盘"),
+        (r"shutdown\s+now", "HIGH", "立即关机"),
+        (r"\breboot\b", "HIGH", "非计划重启"),
+        (r"\bhalt\b", "HIGH", "停机指令"),
+        (r"\bpoweroff\b", "HIGH", "关机指令"),
+        (r"no\s+shutdown", "SAFE", "启用接口"),
+        (r"write\s+erase", "CRITICAL", "清除配置"),
+        (r"write\s+memory", "LOW", "保存配置"),
+        (r"clear\s+logging", "MEDIUM", "清除日志"),
+        (r"clear\s+arp", "LOW", "清除ARP表"),
+        (r"clear\s+mac\s+address", "MEDIUM", "清除MAC表"),
+        (r"clear\s+counters", "LOW", "清除计数器"),
+        (r"no\s+ip\s+route", "MEDIUM", "删除路由"),
+        (r"no\s+access-list", "MEDIUM", "删除ACL"),
+        (r"no\s+interface", "HIGH", "删除接口配置"),
+        (r"factory.reset", "CRITICAL", "恢复出厂设置"),
+        (r"reset\s+saved", "CRITICAL", "清除保存配置"),
+        (r"reset\s+system", "CRITICAL", "重置系统"),
     ]
-]
 
-# 危险命令模式（19条）
-DANGEROUS_COMMAND_PATTERNS = [
-    re.compile(p, re.IGNORECASE) for p in [
-        r"erase\s+(flash|startup|running)",
-        r"delete\s+(flash|nvram)",
-        r"format\s+flash",
-        r"reload",
-        r"reboot",
-        r"shutdown",
-        r"factory-reset",
-        r"restore\s+default",
-        r"no\s+ip\s+routing",
-        r"no\s+spanning-tree",
-        r"no\s+access-list",
-        r"clear\s+(arp|mac|ip\s+route)\s+",
-        r"write\s+(erase|memory)",
-        r"copy\s+running-config\s+startup-config",
-        r"configure\s+replace",
-        r"rollback\s+running-config",
-        r"issu\s+(abort|changeversion)",
-        r"license\s+(reset|install\s+boot)",
-        r"boot\s+system\s+",
+    MALICIOUS_PATTERNS = [
+        (r"(curl|wget)\s+.*\|\s*(bash|sh)", "CRITICAL", "远程脚本执行"),
+        (r"(powershell|cmd)\s+/c\s+", "HIGH", "系统命令执行"),
+        (r"(chmod|chown)\s+777", "HIGH", "危险权限修改"),
+        (r"(rm\s+-rf|del\s+/[sfq])", "CRITICAL", "递归强制删除"),
+        (r"(nc|ncat|netcat)\s+-[elp]", "HIGH", "反向Shell"),
+        (r"(crypto|miner|xmrig|stratum)", "CRITICAL", "挖矿脚本特征"),
+        (r"(eval|exec)\s*\(", "HIGH", "动态代码执行"),
+        (r"(import\s+os|subprocess|os\.system)", "MEDIUM", "系统调用导入"),
+        (r";\s*(rm|del|format|shutdown|reboot)", "CRITICAL", "命令链注入"),
+        (r"&&\s*(rm|del|format|shutdown|reboot)", "CRITICAL", "命令链注入"),
+        (r"\|\s*(bash|sh|python|perl|ruby|nc)", "HIGH", "管道命令执行"),
+        (r"\$\{.*\}", "MEDIUM", "变量替换注入"),
+        (r"\$\([^)]+\)", "HIGH", "命令替换注入"),
+        (r"`[^`]+`", "HIGH", "反引号命令替换"),
+        (r"(\.\./){2,}", "HIGH", "路径遍历攻击"),
+        (r"/etc/(passwd|shadow|hosts)", "CRITICAL", "敏感文件访问"),
+        (r"(SELECT|INSERT|UPDATE|DELETE|DROP)\s+.*\s+FROM", "HIGH", "SQL注入特征"),
+        (r"UNION\s+(ALL\s+)?SELECT", "HIGH", "SQL联合注入"),
+        (r"OR\s+1\s*=\s*1", "HIGH", "SQL逻辑绕过"),
+        (r"<script[^>]*>", "HIGH", "XSS脚本注入"),
+        (r"javascript\s*:", "MEDIUM", "JavaScript协议注入"),
+        (r"on(error|load|click|mouseover)\s*=", "MEDIUM", "事件处理器注入"),
+        (r"(base64|hex|rot13)\s+-[d]", "MEDIUM", "编码解码执行"),
+        (r"(ssh|telnet|ftp)\s+.*-p\s+\d+", "MEDIUM", "远程连接尝试"),
+        (r"(dd\s+if=|mkfs\.|fdisk)", "CRITICAL", "磁盘操作指令"),
+        (r"(iptables|firewall-cmd|ufw)\s+-[ADFI]", "HIGH", "防火墙规则篡改"),
+        (r"(crontab|at\s+|systemctl\s+enable)", "MEDIUM", "定时任务/服务持久化"),
     ]
-]
 
-# 恶意意图模式（31条）
-MALICIOUS_INTENT_PATTERNS = [
-    re.compile(p, re.IGNORECASE) for p in [
-        r"删除\s*(所有|全部)\s*(配置|数据|文件)",
-        r"清空\s*(设备|路由|ARP)",
-        r"关闭\s*(防火墙|安全|认证)",
-        r"绕过\s*(安全|认证|授权)",
-        r"提权|提权|root\s*权限",
-        r"后门|木马|病毒",
-        r"嗅探|抓包|监听",
-        r"攻击|入侵|渗透",
-        r"DDoS|拒绝服务",
-        r"暴力破解|字典攻击",
-        r"SQL\s*注入",
-        r"XSS|跨站脚本",
-        r"CSRF|跨站请求",
-        r"中间人攻击",
-        r"ARP\s*欺骗",
-        r"DNS\s*劫持",
-        r"端口扫描",
-        r"漏洞利用",
-        r"提权漏洞",
-        r"零日漏洞",
-        r"社工攻击",
-        r"钓鱼攻击",
-        r"勒索软件",
-        r"挖矿程序",
-        r"僵尸网络",
-        r"远程控制",
-        r"数据泄露",
-        r"隐私窃取",
-        r"密钥窃取",
-        r"证书伪造",
-        r"身份冒充",
+    CHINESE_DANGEROUS_KEYWORDS = [
+        ("删除系统", "CRITICAL", "删除系统意图"),
+        ("删除所有", "CRITICAL", "批量删除意图"),
+        ("删除配置", "HIGH", "删除配置意图"),
+        ("清除配置", "HIGH", "清除配置意图"),
+        ("清除所有", "CRITICAL", "批量清除意图"),
+        ("恢复出厂", "CRITICAL", "恢复出厂设置意图"),
+        ("格式化", "HIGH", "格式化磁盘意图"),
+        ("擦除", "HIGH", "擦除数据意图"),
+        ("关机", "MEDIUM", "关机意图"),
+        ("重启设备", "MEDIUM", "重启设备意图"),
+        ("注入攻击", "CRITICAL", "注入攻击意图"),
+        ("提权", "HIGH", "权限提升意图"),
+        ("后门", "CRITICAL", "后门植入意图"),
+        ("绕过验证", "HIGH", "绕过安全验证意图"),
+        ("绕过防火墙", "HIGH", "绕过防火墙意图"),
+        ("漏洞利用", "CRITICAL", "漏洞利用意图"),
+        ("越权访问", "HIGH", "越权访问意图"),
+        ("暴力破解", "HIGH", "暴力破解意图"),
+        ("端口扫描", "MEDIUM", "端口扫描意图"),
+        ("嗅探", "MEDIUM", "网络嗅探意图"),
+        ("中间人攻击", "CRITICAL", "中间人攻击意图"),
+        ("拒绝服务", "HIGH", "拒绝服务攻击意图"),
+        ("数据窃取", "CRITICAL", "数据窃取意图"),
+        ("权限提升", "HIGH", "权限提升意图"),
+        ("远程控制", "HIGH", "远程控制意图"),
+        ("命令注入", "CRITICAL", "命令注入意图"),
+        ("SQL注入", "CRITICAL", "SQL注入意图"),
+        ("跨站脚本", "HIGH", "XSS攻击意图"),
+        ("攻击", "MEDIUM", "攻击意图"),
+        ("漏洞", "MEDIUM", "漏洞利用意图"),
+        ("绕过", "MEDIUM", "安全绕过意图"),
+        ("注入", "MEDIUM", "注入意图"),
+        ("后门程序", "CRITICAL", "后门程序意图"),
+        ("木马", "CRITICAL", "木马程序意图"),
+        ("病毒", "HIGH", "病毒相关意图"),
+        ("恶意代码", "CRITICAL", "恶意代码意图"),
+        ("爆破", "HIGH", "暴力破解意图"),
+        ("弱口令", "MEDIUM", "弱口令探测意图"),
+        ("未授权", "HIGH", "未授权访问意图"),
     ]
-]
 
+    OBFUSCATION_PATTERNS = [
+        (r"\\x[0-9a-fA-F]{2}", "MEDIUM", "十六进制编码绕过"),
+        (r"\\u[0-9a-fA-F]{4}", "MEDIUM", "Unicode编码绕过"),
+        (r"\\[0-7]{3}", "MEDIUM", "八进制编码绕过"),
+        (r"%[0-9a-fA-F]{2}", "LOW", "URL编码特征"),
+        (r"&#[0-9]+;", "LOW", "HTML实体编码"),
+        (r"&#x[0-9a-fA-F]+;", "LOW", "HTML十六进制编码"),
+        (r"\b\w+\s*\+\s*\w+\s*\+\s*\w+", "MEDIUM", "字符串拼接绕过"),
+        (r"\$\(echo\s+['\"]", "HIGH", "动态命令构造"),
+        (r"eval\s*\(\s*['\"]", "HIGH", "动态代码执行"),
+        (r"base64\s+-d\s*\|", "HIGH", "Base64解码管道执行"),
+    ]
 
-class SecurityAgent:
-    """安全Agent - 6层安全防护"""
+    COMMAND_CHAIN_SEPARATORS = re.compile(
+        r'[;|&`$\(\)]'
+    )
 
-    def __init__(self, config: Optional[SecurityConfig] = None):
-        self.config = config or SecurityConfig()
-        self._rate_limit_tracker: dict[str, list[float]] = {}
-        self._rollback_snapshots: dict[str, dict[str, Any]] = {}
-        self._stats: dict[str, int] = {
-            "total_checks": 0,
-            "prompt_injections_blocked": 0,
-            "dangerous_commands_blocked": 0,
-            "malicious_intents_blocked": 0,
-            "rate_limits_triggered": 0,
-            "change_window_violations": 0,
-            "rollbacks_performed": 0,
-        }
-        logger.info(f"安全Agent初始化完成, 注入模式: {settings.prompt_injection_patterns_count}种, 沙箱命令: {settings.sandbox_dangerous_commands}条")
+    def _normalize_input(self, text: str) -> str:
+        normalized = text
+        try:
+            normalized = html.unescape(normalized)
+        except Exception as e:
+            logger.warning(f"HTML unescape failed: {e}")
+        try:
+            decoded = urllib.parse.unquote(normalized)
+            if decoded != normalized:
+                normalized = decoded
+        except Exception as e:
+            logger.warning(f"URL unquote failed: {e}")
+        hex_entity_pattern = re.compile(r'\\x([0-9a-fA-F]{2})')
+        normalized = hex_entity_pattern.sub(lambda m: chr(int(m.group(1), 16)), normalized)
+        unicode_pattern = re.compile(r'\\u([0-9a-fA-F]{4})')
+        normalized = unicode_pattern.sub(lambda m: chr(int(m.group(1), 16)), normalized)
+        normalized = re.sub(r'\s+', ' ', normalized).strip()
+        return normalized
 
-    def check_prompt_injection(self, user_input: str) -> SecurityCheckResult:
-        """第1层：Prompt注入防护"""
-        if not self.config.enable_prompt_injection_detection:
-            return SecurityCheckResult(level=SecurityLevel.SAFE)
+    def _detect_obfuscation(self, text: str) -> List[Dict[str, Any]]:
+        threats = []
+        for pattern, level, desc in self.OBFUSCATION_PATTERNS:
+            if re.search(pattern, text, re.IGNORECASE):
+                threats.append({
+                    "input": text[:100],
+                    "pattern": pattern,
+                    "level": level,
+                    "description": desc,
+                    "type": "obfuscation"
+                })
+        return threats
 
-        detected_patterns = []
-        for i, pattern in enumerate(PROMPT_INJECTION_PATTERNS):
-            if pattern.search(user_input):
-                detected_patterns.append(f"pattern_{i+1}")
+    def _detect_command_chaining(self, cmd: str) -> List[Dict[str, Any]]:
+        threats = []
+        separators = self.COMMAND_CHAIN_SEPARATORS.findall(cmd)
+        if len(separators) >= 2:
+            threats.append({
+                "command": cmd[:100],
+                "level": "HIGH",
+                "description": f"多重命令链接 ({len(separators)}个分隔符)",
+                "type": "command_chaining"
+            })
+        return threats
 
-        if detected_patterns:
-            self._stats["prompt_injections_blocked"] += 1
-            logger.warning(f"Prompt注入检测: 发现 {len(detected_patterns)} 个匹配模式")
-            return SecurityCheckResult(
-                level=SecurityLevel.BLOCKED,
-                threat_type=ThreatType.PROMPT_INJECTION,
-                message=f"检测到Prompt注入攻击，匹配 {len(detected_patterns)} 个模式",
-                details={"patterns": detected_patterns},
-                blocked=True,
-            )
+    def _scan_chinese_keywords(self, text: str) -> List[Dict[str, Any]]:
+        threats = []
+        for keyword, level, desc in self.CHINESE_DANGEROUS_KEYWORDS:
+            if keyword in text:
+                threats.append({
+                    "input": text[:100],
+                    "keyword": keyword,
+                    "level": level,
+                    "description": desc,
+                    "type": "chinese_dangerous_keyword"
+                })
+        return threats
 
-        return SecurityCheckResult(level=SecurityLevel.SAFE)
+    def scan_commands(self, commands: List[str]) -> SecurityScanResult:
+        threats = []
+        sanitized = []
 
-    def check_intent_safety(self, intent: dict[str, Any]) -> SecurityCheckResult:
-        """第2层：意图安全扫描"""
-        intent_str = str(intent)
-        for pattern in MALICIOUS_INTENT_PATTERNS:
-            if pattern.search(intent_str):
-                self._stats["malicious_intents_blocked"] += 1
-                return SecurityCheckResult(
-                    level=SecurityLevel.BLOCKED,
-                    threat_type=ThreatType.MALICIOUS_INTENT,
-                    message="检测到恶意意图",
-                    details={"intent": intent},
-                    blocked=True,
-                )
-
-        intent_type = intent.get("intent_type", "")
-        high_risk_types = ["delete_config", "reset_device", "shutdown_interface"]
-        if intent_type in high_risk_types:
-            return SecurityCheckResult(
-                level=SecurityLevel.WARNING,
-                threat_type=ThreatType.SENSITIVE_OPERATION,
-                message=f"敏感操作: {intent_type}",
-                details={"intent": intent},
-                requires_approval=True,
-            )
-
-        return SecurityCheckResult(level=SecurityLevel.SAFE)
-
-    def check_sandbox(self, commands: list[str]) -> SecurityCheckResult:
-        """第3层：沙箱检测"""
-        if not self.config.enable_sandbox_detection:
-            return SecurityCheckResult(level=SecurityLevel.SAFE)
-
-        dangerous_found = []
         for cmd in commands:
-            for pattern in DANGEROUS_COMMAND_PATTERNS:
-                if pattern.search(cmd):
-                    dangerous_found.append(cmd)
-                    break
-            for sensitive in self.config.sensitive_commands:
-                if sensitive.lower() in cmd.lower():
-                    dangerous_found.append(cmd)
-                    break
+            normalized = self._normalize_input(cmd)
+            cmd_threats = self._scan_single_command(normalized)
+            cmd_threats.extend(self._detect_command_chaining(normalized))
+            cmd_threats.extend(self._detect_obfuscation(cmd))
 
-        if dangerous_found:
-            self._stats["dangerous_commands_blocked"] += 1
-            return SecurityCheckResult(
-                level=SecurityLevel.DANGEROUS,
-                threat_type=ThreatType.DANGEROUS_COMMAND,
-                message=f"检测到 {len(dangerous_found)} 条危险命令",
-                details={"dangerous_commands": dangerous_found},
-                requires_approval=True,
-            )
+            if cmd_threats:
+                threats.extend(cmd_threats)
+                if any(t["level"] in ["CRITICAL", "HIGH"] for t in cmd_threats):
+                    sanitized.append(f"# BLOCKED: {cmd}")
+                else:
+                    sanitized.append(cmd)
+            else:
+                sanitized.append(cmd)
 
-        return SecurityCheckResult(level=SecurityLevel.SAFE)
+        threat_level = ThreatLevel.SAFE
+        if threats:
+            levels = {"CRITICAL": 4, "HIGH": 3, "MEDIUM": 2, "LOW": 1, "SAFE": 0}
+            max_level = max(levels.get(t["level"], 0) for t in threats)
+            level_map = {4: ThreatLevel.CRITICAL, 3: ThreatLevel.HIGH, 2: ThreatLevel.MEDIUM, 1: ThreatLevel.LOW}
+            threat_level = level_map.get(max_level, ThreatLevel.SAFE)
 
-    def check_change_window(self) -> SecurityCheckResult:
-        """第4层：变更窗口检查"""
-        if not self.config.enable_change_window:
-            return SecurityCheckResult(level=SecurityLevel.SAFE)
-
-        now = time.localtime()
-        current_time = f"{now.tm_hour:02d}:{now.tm_min:02d}"
-
-        start = self.config.change_window_start
-        end = self.config.change_window_end
-
-        if start <= current_time <= end:
-            return SecurityCheckResult(level=SecurityLevel.SAFE)
-
-        self._stats["change_window_violations"] += 1
-        return SecurityCheckResult(
-            level=SecurityLevel.WARNING,
-            threat_type=ThreatType.OUTSIDE_WINDOW,
-            message=f"当前不在变更窗口内 ({start}-{end})",
-            details={"current_time": current_time, "window": f"{start}-{end}"},
-            requires_approval=True,
+        return SecurityScanResult(
+            is_safe=threat_level in [ThreatLevel.SAFE, ThreatLevel.LOW],
+            threat_level=threat_level,
+            threats=threats,
+            sanitized_commands=sanitized,
+            scan_time=datetime.now().isoformat()
         )
 
-    def save_snapshot(self, device_id: str, config_data: dict[str, Any]):
-        """第5层：保存配置快照用于回滚"""
-        if not self.config.enable_rollback:
-            return
-        self._rollback_snapshots[device_id] = {
-            "config": config_data,
-            "timestamp": time.time(),
-        }
-        logger.info(f"配置快照已保存: {device_id}")
+    def _scan_single_command(self, cmd: str) -> List[Dict[str, Any]]:
+        threats = []
 
-    def get_snapshot(self, device_id: str) -> Optional[dict[str, Any]]:
-        """获取配置快照"""
-        snapshot = self._rollback_snapshots.get(device_id)
-        if snapshot:
-            return snapshot.get("config")
-        return None
+        for pattern, level, desc in self.DANGEROUS_COMMANDS:
+            if re.search(pattern, cmd, re.IGNORECASE):
+                if level != "SAFE":
+                    threats.append({
+                        "command": cmd,
+                        "pattern": pattern,
+                        "level": level,
+                        "description": desc,
+                        "type": "dangerous_command"
+                    })
 
-    def check_rate_limit(self, user_id: str) -> SecurityCheckResult:
-        """第6层：限流检查"""
-        if not self.config.enable_rate_limiting:
-            return SecurityCheckResult(level=SecurityLevel.SAFE)
+        for pattern, level, desc in self.MALICIOUS_PATTERNS:
+            if re.search(pattern, cmd, re.IGNORECASE):
+                threats.append({
+                    "command": cmd,
+                    "pattern": pattern,
+                    "level": level,
+                    "description": desc,
+                    "type": "malicious_pattern"
+                })
 
-        now = time.time()
-        if user_id not in self._rate_limit_tracker:
-            self._rate_limit_tracker[user_id] = []
+        return threats
 
-        timestamps = self._rate_limit_tracker[user_id]
-        timestamps.append(now)
+    def scan_natural_language(self, text: str) -> SecurityScanResult:
+        normalized = self._normalize_input(text)
+        threats = []
 
-        timestamps[:] = [t for t in timestamps if now - t < 3600]
-        self._rate_limit_tracker[user_id] = timestamps
+        for pattern, level, desc in self.MALICIOUS_PATTERNS:
+            if re.search(pattern, normalized, re.IGNORECASE):
+                threats.append({
+                    "input": normalized[:100],
+                    "pattern": pattern,
+                    "level": level,
+                    "description": desc,
+                    "type": "malicious_input"
+                })
 
-        recent_minute = [t for t in timestamps if now - t < 60]
-        if len(recent_minute) > self.config.max_requests_per_minute:
-            self._stats["rate_limits_triggered"] += 1
-            return SecurityCheckResult(
-                level=SecurityLevel.BLOCKED,
-                threat_type=ThreatType.RATE_LIMITED,
-                message=f"触发分钟限流 ({len(recent_minute)}/{self.config.max_requests_per_minute})",
-                blocked=True,
-            )
+        threats.extend(self._scan_chinese_keywords(normalized))
+        threats.extend(self._detect_obfuscation(text))
 
-        if len(timestamps) > self.config.max_requests_per_hour:
-            self._stats["rate_limits_triggered"] += 1
-            return SecurityCheckResult(
-                level=SecurityLevel.BLOCKED,
-                threat_type=ThreatType.RATE_LIMITED,
-                message=f"触发小时限流 ({len(timestamps)}/{self.config.max_requests_per_hour})",
-                blocked=True,
-            )
+        threat_level = ThreatLevel.SAFE
+        if threats:
+            levels = {"CRITICAL": 4, "HIGH": 3, "MEDIUM": 2, "LOW": 1}
+            max_level = max(levels.get(t["level"], 0) for t in threats)
+            level_map = {4: ThreatLevel.CRITICAL, 3: ThreatLevel.HIGH, 2: ThreatLevel.MEDIUM, 1: ThreatLevel.LOW}
+            threat_level = level_map.get(max_level, ThreatLevel.SAFE)
 
-        return SecurityCheckResult(level=SecurityLevel.SAFE)
+        sanitized_text = text
+        for threat in threats:
+            pattern = threat.get("pattern", "")
+            if pattern and len(pattern) >= 3:
+                sanitized_text = sanitized_text.replace(pattern, "[REDACTED]")
 
-    def full_security_check(
-        self,
-        user_input: str,
-        intent: Optional[dict] = None,
-        commands: Optional[list] = None,
-        user_id: str = "default",
-    ) -> SecurityCheckResult:
-        """完整6层安全检查"""
-        self._stats["total_checks"] += 1
+        return SecurityScanResult(
+            is_safe=threat_level in [ThreatLevel.SAFE, ThreatLevel.LOW],
+            threat_level=threat_level,
+            threats=threats,
+            sanitized_commands=[sanitized_text] if sanitized_text != text else [text],
+            scan_time=datetime.now().isoformat()
+        )
 
-        result = self.check_prompt_injection(user_input)
-        if result.blocked:
-            return result
 
-        result = self.check_rate_limit(user_id)
-        if result.blocked:
-            return result
 
-        if intent:
-            result = self.check_intent_safety(intent)
-            if result.blocked:
-                return result
-
-        if commands:
-            result = self.check_sandbox(commands)
-            if result.blocked:
-                return result
-
-        result = self.check_change_window()
-        return result
-
-    def get_stats(self) -> dict[str, Any]:
-        """获取安全统计"""
-        return self._stats
-
-    async def process(self, input_data: dict[str, Any]) -> dict[str, Any]:
-        """Agent标准处理接口"""
-        action = input_data.get("action", "full_check")
-
-        if action == "full_check":
-            result = self.full_security_check(
-                user_input=input_data.get("user_input", ""),
-                intent=input_data.get("intent"),
-                commands=input_data.get("commands"),
-                user_id=input_data.get("user_id", "default"),
-            )
-            return {
-                "action": "full_check",
-                "level": result.level.value,
-                "threat_type": result.threat_type.value if result.threat_type else None,
-                "message": result.message,
-                "requires_approval": result.requires_approval,
-                "blocked": result.blocked,
-            }
-
-        elif action == "prompt_injection_check":
-            result = self.check_prompt_injection(input_data.get("user_input", ""))
-            return {"action": "prompt_injection_check", "level": result.level.value, "blocked": result.blocked}
-
-        elif action == "sandbox_check":
-            result = self.check_sandbox(input_data.get("commands", []))
-            return {"action": "sandbox_check", "level": result.level.value, "requires_approval": result.requires_approval}
-
-        elif action == "save_snapshot":
-            self.save_snapshot(input_data.get("device_id", ""), input_data.get("config_data", {}))
-            return {"action": "save_snapshot", "success": True}
-
-        elif action == "get_snapshot":
-            config = self.get_snapshot(input_data.get("device_id", ""))
-            return {"action": "get_snapshot", "config": config}
-
-        else:
-            return {"action": action, "error": "未知操作"}
-
-    async def health_check(self) -> dict[str, Any]:
-        """健康检查"""
-        return {
-            "status": "healthy",
-            "patterns_loaded": {
-                "prompt_injection": len(PROMPT_INJECTION_PATTERNS),
-                "dangerous_commands": len(DANGEROUS_COMMAND_PATTERNS),
-                "malicious_intents": len(MALICIOUS_INTENT_PATTERNS),
-            },
-            "snapshots_stored": len(self._rollback_snapshots),
-            "stats": self._stats,
-        }

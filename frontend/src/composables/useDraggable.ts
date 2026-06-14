@@ -1,116 +1,75 @@
-import { ref, computed, onMounted, onUnmounted, type Ref } from 'vue'
+import { ref, onMounted, onUnmounted } from 'vue'
 
-interface DragOptions {
-  /** 初始 X 坐标 */
-  initialX?: number
-  /** 初始 Y 坐标 */
-  initialY?: number
-  /** 拖拽边界限制 */
-  bounds?: {
-    left?: number
-    top?: number
-    right?: number
-    bottom?: number
-  }
-  /** 拖拽手柄选择器，仅在手柄区域内可拖拽 */
-  handle?: string
-  /** 是否禁用拖拽 */
-  disabled?: boolean
-}
-
-interface DragPosition {
+interface Position {
   x: number
   y: number
 }
 
-export function useDraggable(
-  elementRef: Ref<HTMLElement | null>,
-  options: DragOptions = {}
-) {
-  const x = ref(options.initialX ?? 0)
-  const y = ref(options.initialY ?? 0)
+export function useDraggable(options?: {
+  initialPosition?: Position
+  snapToEdge?: boolean
+  onDragStart?: () => void
+  onDragEnd?: () => void
+}) {
+  const position = ref<Position>(options?.initialPosition || { x: window.innerWidth - 70, y: window.innerHeight / 2 - 28 })
   const isDragging = ref(false)
+  const dragOffset = ref<Position>({ x: 0, y: 0 })
+  const opacity = ref(1)
+  const snapToEdge = options?.snapToEdge !== false
 
-  let startX = 0
-  let startY = 0
-  let startPosX = 0
-  let startPosY = 0
+  const handlePointerDown = (e: PointerEvent) => {
+    isDragging.value = true
+    dragOffset.value = {
+      x: e.clientX - position.value.x,
+      y: e.clientY - position.value.y
+    }
+    opacity.value = 0.5
+    ;(e.target as HTMLElement).setPointerCapture(e.pointerId)
+    options?.onDragStart?.()
+  }
 
-  const style = computed(() => ({
-    position: 'absolute' as const,
-    left: `${x.value}px`,
-    top: `${y.value}px`,
-    cursor: isDragging.value ? 'grabbing' : 'grab',
-    userSelect: isDragging.value ? 'none' as const : 'auto' as const
-  }))
-
-  function clampPosition(posX: number, posY: number): DragPosition {
-    const bounds = options.bounds
-    if (!bounds) return { x: posX, y: posY }
-
-    return {
-      x: Math.max(bounds.left ?? -Infinity, Math.min(bounds.right ?? Infinity, posX)),
-      y: Math.max(bounds.top ?? -Infinity, Math.min(bounds.bottom ?? Infinity, posY))
+  const handlePointerMove = (e: PointerEvent) => {
+    if (!isDragging.value) return
+    const newX = e.clientX - dragOffset.value.x
+    const newY = e.clientY - dragOffset.value.y
+    position.value = {
+      x: Math.max(0, Math.min(newX, window.innerWidth - 56)),
+      y: Math.max(0, Math.min(newY, window.innerHeight - 56))
     }
   }
 
-  function onMouseDown(event: MouseEvent): void {
-    if (options.disabled) return
-
-    // 如果指定了拖拽手柄，检查事件目标是否在手柄内
-    if (options.handle && elementRef.value) {
-      const handle = elementRef.value.querySelector(options.handle)
-      if (handle && !handle.contains(event.target as Node)) {
-        return
+  const handlePointerUp = () => {
+    if (!isDragging.value) return
+    isDragging.value = false
+    opacity.value = 1
+    if (snapToEdge) {
+      const centerX = window.innerWidth / 2
+      position.value = {
+        x: position.value.x < centerX ? 20 : window.innerWidth - 76,
+        y: Math.max(20, Math.min(position.value.y, window.innerHeight - 76))
       }
     }
-
-    event.preventDefault()
-    isDragging.value = true
-    startX = event.clientX
-    startY = event.clientY
-    startPosX = x.value
-    startPosY = y.value
-
-    document.addEventListener('mousemove', onMouseMove)
-    document.addEventListener('mouseup', onMouseUp)
+    options?.onDragEnd?.()
   }
 
-  function onMouseMove(event: MouseEvent): void {
-    if (!isDragging.value) return
-
-    const deltaX = event.clientX - startX
-    const deltaY = event.clientY - startY
-    const newPos = clampPosition(startPosX + deltaX, startPosY + deltaY)
-
-    x.value = newPos.x
-    y.value = newPos.y
-  }
-
-  function onMouseUp(): void {
-    isDragging.value = false
-    document.removeEventListener('mousemove', onMouseMove)
-    document.removeEventListener('mouseup', onMouseUp)
-  }
-
-  onMounted(() => {
-    if (elementRef.value) {
-      elementRef.value.addEventListener('mousedown', onMouseDown)
+  const handleResize = () => {
+    if (position.value.x > window.innerWidth - 56) {
+      position.value.x = window.innerWidth - 76
     }
-  })
-
-  onUnmounted(() => {
-    if (elementRef.value) {
-      elementRef.value.removeEventListener('mousedown', onMouseDown)
+    if (position.value.y > window.innerHeight - 56) {
+      position.value.y = window.innerHeight - 76
     }
-    document.removeEventListener('mousemove', onMouseMove)
-    document.removeEventListener('mouseup', onMouseUp)
-  })
+  }
+
+  onMounted(() => window.addEventListener('resize', handleResize))
+  onUnmounted(() => window.removeEventListener('resize', handleResize))
 
   return {
-    x,
-    y,
+    position,
     isDragging,
-    style
+    opacity,
+    handlePointerDown,
+    handlePointerMove,
+    handlePointerUp
   }
 }

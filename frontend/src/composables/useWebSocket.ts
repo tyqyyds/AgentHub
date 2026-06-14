@@ -1,223 +1,196 @@
-import { ref } from 'vue'
+import { ref, onUnmounted, readonly, getCurrentInstance } from 'vue'
+import { API_BASE_URL } from '@/config'
+import { useLogger } from '@/utils/logger'
+
+const { info, warn } = useLogger()
+
+type WsMessageType = 'connection_established' | 'message' | 'notification' | 'status_update' | 'topology_update' | 'alert' | 'intent_update' | 'device_update' | 'assistant_action' | 'pong' | 'proactive_notification' | 'playbook_step' | 'grayscale_progress' | 'sla_alert' | 'emergency_fuse'
 
 interface WsMessage {
-  type: string
-  data: unknown
+  type: WsMessageType
+  data?: Record<string, unknown>
+  sender?: string
+  role?: string
+  timestamp?: number
 }
 
-export type WsMessageType =
-  | 'connection_established'
-  | 'message'
-  | 'notification'
-  | 'status_update'
-  | 'topology_update'
-  | 'device_update'
-  | 'alert'
-  | 'intent_update'
-  | 'assistant_action'
-  | 'proactive_notification'
-  | 'playbook_step'
-  | 'grayscale_progress'
-  | 'sla_alert'
-  | 'emergency_fuse'
-  | 'ping_pong'
+type MessageHandler = (message: WsMessage) => void
 
-// ── 单例模块级状态 ──
-let instanceCount = 0
-const sharedWs = ref<WebSocket | null>(null)
-const sharedConnected = ref(false)
-const sharedLastMessage = ref<WsMessage | null>(null)
-const sharedReconnectAttempts = ref(0)
-const sharedPollingMode = ref(false)
-const sharedAuthFailed = ref(false)
-
-let heartbeatTimer: ReturnType<typeof setInterval> | null = null
-let pollingTimer: ReturnType<typeof setInterval> | null = null
+const wsInstance = ref<WebSocket | null>(null)
+const isConnected = ref(false)
+const reconnectAttempts = ref(0)
+const MAX_RECONNECT_ATTEMPTS = 5
+const RECONNECT_DELAY = 3000
 let reconnectTimer: ReturnType<typeof setTimeout> | null = null
+let pingTimer: ReturnType<typeof setInterval> | null = null
+const handlers: Map<WsMessageType, Set<MessageHandler>> = new Map()
+let activeComposableCount = 0
 
-const maxReconnectAttempts = 5
-const heartbeatInterval = 30000
-const pollingInterval = 10000
-
-function clearHeartbeat() {
-  if (heartbeatTimer !== null) {
-    clearInterval(heartbeatTimer)
-    heartbeatTimer = null
+const getWsUrl = (): string => {
+  const token = localStorage.getItem('access_token')
+  let base: string
+  if (API_BASE_URL) {
+    base = API_BASE_URL.replace(/^http/, 'ws')
+  } else {
+    const protocol = window.location.protocol === 'https:' ? 'wss:' : 'ws:'
+    base = `${protocol}//${window.location.host}`
   }
+  return `${base}/ws${token ? `?token=${token}` : ''}`
 }
 
-function startHeartbeat() {
-  clearHeartbeat()
-  heartbeatTimer = setInterval(() => {
-    if (sharedWs.value?.readyState === WebSocket.OPEN) {
-      sharedWs.value.send(JSON.stringify({ type: 'ping_pong', data: {} }))
+const startPing = () => {
+  if (pingTimer) clearInterval(pingTimer)
+  pingTimer = setInterval(() => {
+    if (wsInstance.value?.readyState === WebSocket.OPEN) {
+      wsInstance.value.send(JSON.stringify({ type: 'ping', timestamp: Date.now() }))
     }
-  }, heartbeatInterval)
+  }, 30000)
 }
 
-function getBaseUrl(): string {
-  const protocol = window.location.protocol === 'https:' ? 'wss:' : 'ws:'
-  return `${protocol}//${window.location.host}/ws`
+const stopPing = () => {
+  if (pingTimer) { clearInterval(pingTimer); pingTimer = null }
 }
 
-function buildWsUrl(url?: string): string {
-  const base = url || getBaseUrl()
-  const token = localStorage.getItem('token')
-  if (!token) return base
-  const separator = base.includes('?') ? '&' : '?'
-  return `${base}${separator}token=${encodeURIComponent(token)}`
+const POLLING_FALLBACK_INTERVAL = 15000
+let pollingTimer: ReturnType<typeof setInterval> | null = null
+let wsFailedPermanently = false
+
+const startPollingFallback = () => {
+  if (pollingTimer) return
+  pollingTimer = setInterval(() => {
+    if (isConnected.value) return
+    const token = localStorage.getItem('access_token')
+    if (!token) return
+    fetch(`${API_BASE_URL || ''}/api/v1/auth/me`, {
+      headers: { 'Authorization': `Bearer ${token}` },
+      credentials: 'include'
+    }).catch(() => {})
+  }, POLLING_FALLBACK_INTERVAL)
 }
 
-function stopPolling() {
-  if (pollingTimer !== null) {
-    clearInterval(pollingTimer)
-    pollingTimer = null
+const stopPollingFallback = () => {
+  if (pollingTimer) { clearInterval(pollingTimer); pollingTimer = null }
+}
+
+const connect = () => {
+  if (wsInstance.value?.readyState === WebSocket.OPEN || wsInstance.value?.readyState === WebSocket.CONNECTING) return
+
+  const token = localStorage.getItem('access_token')
+  if (!token) { warn('WebSocket: No access token, skipping connection'); return }
+
+  if (wsFailedPermanently) {
+    startPollingFallback()
+    return
   }
-  sharedPollingMode.value = false
-}
 
-function startPolling() {
-  stopPolling()
-  sharedPollingMode.value = true
-  const poll = async () => {
-    try {
-      const token = localStorage.getItem('token')
-      const headers: Record<string, string> = {}
-      if (token) headers['Authorization'] = `Bearer ${token}`
-      const res = await fetch('/api/v1/notifications/poll', { headers })
-      if (res.status === 401) {
-        sharedAuthFailed.value = true
-        stopPolling()
+  try {
+    const url = getWsUrl()
+    wsInstance.value = new WebSocket(url)
+
+    wsInstance.value.onopen = () => {
+      isConnected.value = true
+      reconnectAttempts.value = 0
+      startPing()
+      stopPollingFallback()
+      info('WebSocket connected')
+    }
+
+    wsInstance.value.onmessage = (event) => {
+      try {
+        const message: WsMessage = JSON.parse(event.data)
+        const typeHandlers = handlers.get(message.type)
+        if (typeHandlers) {
+          typeHandlers.forEach(handler => handler(message))
+        }
+        const allHandlers = handlers.get('*' as WsMessageType)
+        if (allHandlers) {
+          allHandlers.forEach(handler => handler(message))
+        }
+      } catch { /* ignore non-JSON messages */ }
+    }
+
+    wsInstance.value.onclose = (event) => {
+      isConnected.value = false
+      stopPing()
+      if (event.code === 4001 || event.code === 4003) {
+        warn('WebSocket: auth failed, stopping reconnect')
+        wsFailedPermanently = true
+        startPollingFallback()
         return
       }
-      if (res.ok) {
-        const data = await res.json()
-        if (data) {
-          sharedLastMessage.value = data
-        }
+      if (event.code !== 1000 && reconnectAttempts.value < MAX_RECONNECT_ATTEMPTS) {
+        reconnectAttempts.value++
+        const delay = RECONNECT_DELAY * Math.min(reconnectAttempts.value, 3)
+        info(`WebSocket reconnecting in ${delay}ms (attempt ${reconnectAttempts.value})`)
+        reconnectTimer = setTimeout(connect, delay)
+      } else if (reconnectAttempts.value >= MAX_RECONNECT_ATTEMPTS) {
+        warn('WebSocket: max reconnect attempts reached, falling back to polling')
+        wsFailedPermanently = true
+        startPollingFallback()
       }
-    } catch {
-      // 轮询失败静默处理，下次间隔重试
     }
+
+    wsInstance.value.onerror = () => {
+      warn('WebSocket connection error')
+    }
+  } catch (err) {
+    warn('WebSocket: Failed to create connection', { error: err instanceof Error ? err.message : String(err) })
+    wsFailedPermanently = true
+    startPollingFallback()
   }
-  poll()
-  pollingTimer = setInterval(poll, pollingInterval)
 }
 
-function connectInternal(baseUrl?: string) {
-  if (sharedWs.value?.readyState === WebSocket.OPEN) return
-  if (sharedAuthFailed.value) return
-
-  const fullUrl = buildWsUrl(baseUrl)
-  sharedWs.value = new WebSocket(fullUrl)
-
-  sharedWs.value.onopen = () => {
-    sharedConnected.value = true
-    sharedReconnectAttempts.value = 0
-    sharedAuthFailed.value = false
-    startHeartbeat()
-    // WebSocket 恢复连接后自动停止轮询
-    if (sharedPollingMode.value) {
-      stopPolling()
-    }
+const disconnect = () => {
+  if (reconnectTimer) { clearTimeout(reconnectTimer); reconnectTimer = null }
+  stopPing()
+  stopPollingFallback()
+  wsFailedPermanently = false
+  reconnectAttempts.value = 0
+  if (wsInstance.value) {
+    wsInstance.value.close(1000, 'Client disconnect')
+    wsInstance.value = null
   }
+  isConnected.value = false
+}
 
-  sharedWs.value.onmessage = (event) => {
-    try {
-      const msg: WsMessage = JSON.parse(event.data)
-      // 收到 pong 响应时重置心跳定时器
-      if (msg.type === 'ping_pong') {
-        clearHeartbeat()
-        startHeartbeat()
+const send = (type: WsMessageType, data?: Record<string, unknown>) => {
+  if (wsInstance.value?.readyState === WebSocket.OPEN) {
+    wsInstance.value.send(JSON.stringify({ type, data, timestamp: Date.now() }))
+  }
+}
+
+const on = (type: WsMessageType | '*', handler: MessageHandler): (() => void) => {
+  const t = type as WsMessageType
+  if (!handlers.has(t)) handlers.set(t, new Set())
+  handlers.get(t)!.add(handler)
+  return () => { handlers.get(t)?.delete(handler) }
+}
+
+const off = (type: WsMessageType | '*', handler: MessageHandler) => {
+  const t = type as WsMessageType
+  handlers.get(t)?.delete(handler)
+}
+
+export function useWebSocket() {
+  const instance = getCurrentInstance()
+  if (instance) {
+    activeComposableCount++
+    onUnmounted(() => {
+      activeComposableCount--
+      if (activeComposableCount <= 0) {
+        activeComposableCount = 0
+        disconnect()
       }
-      // 检测 401 认证失败响应
-      if (msg.type === 'error' && (msg.data as { code?: number })?.code === 401) {
-        sharedAuthFailed.value = true
-        clearHeartbeat()
-        if (sharedWs.value) {
-          sharedWs.value.close()
-        }
-        return
-      }
-      sharedLastMessage.value = msg
-    } catch {
-      sharedLastMessage.value = { type: 'raw', data: event.data }
-    }
-  }
-
-  sharedWs.value.onclose = (event) => {
-    sharedConnected.value = false
-    clearHeartbeat()
-
-    // 认证失败（close code 4001）停止重连
-    if (event.code === 4001) {
-      sharedAuthFailed.value = true
-      return
-    }
-
-    if (sharedAuthFailed.value) return
-
-    if (sharedReconnectAttempts.value < maxReconnectAttempts) {
-      sharedReconnectAttempts.value++
-      reconnectTimer = setTimeout(() => connectInternal(baseUrl), 2000 * sharedReconnectAttempts.value)
-    } else {
-      // 连续 5 次重连失败，降级为 HTTP 轮询
-      startPolling()
-    }
-  }
-
-  sharedWs.value.onerror = () => {
-    sharedConnected.value = false
-  }
-}
-
-function disconnectInternal() {
-  clearHeartbeat()
-  stopPolling()
-  if (reconnectTimer !== null) {
-    clearTimeout(reconnectTimer)
-    reconnectTimer = null
-  }
-  if (sharedWs.value) {
-    sharedWs.value.close()
-    sharedWs.value = null
-    sharedConnected.value = false
-  }
-  sharedAuthFailed.value = false
-}
-
-function sendInternal(message: WsMessage) {
-  if (sharedWs.value?.readyState === WebSocket.OPEN) {
-    sharedWs.value.send(JSON.stringify(message))
-  }
-}
-
-export function useWebSocket(url?: string) {
-  instanceCount++
-
-  function connect() {
-    connectInternal(url)
-  }
-
-  function disconnect() {
-    disconnectInternal()
-  }
-
-  function send(message: WsMessage) {
-    sendInternal(message)
+    })
   }
 
   return {
-    ws: sharedWs,
-    connected: sharedConnected,
-    lastMessage: sharedLastMessage,
-    reconnectAttempts: sharedReconnectAttempts,
-    pollingMode: sharedPollingMode,
-    authFailed: sharedAuthFailed,
+    isConnected: readonly(isConnected),
+    reconnectAttempts: readonly(reconnectAttempts),
     connect,
     disconnect,
     send,
-    startPolling,
-    stopPolling
+    on,
+    off
   }
 }

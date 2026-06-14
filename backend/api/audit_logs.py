@@ -1,189 +1,171 @@
 from fastapi import APIRouter, Depends, HTTPException, Query
 from sqlalchemy.ext.asyncio import AsyncSession
-from sqlalchemy import select, func
+from sqlalchemy import select, func, desc, case
 from pydantic import BaseModel
+from backend.database.connection import get_db_session
+from backend.core.cache import api_cache
+from backend.database.models import AuditLog
+from backend.core.security.rbac import get_current_user, requires_permission
 from typing import Optional
-from datetime import datetime
-from ..database.connection import get_db_session
-from ..database.models import AuditLog
-from .deps import get_current_user
+import logging
+
+logger = logging.getLogger(__name__)
 
 router = APIRouter()
 
 
-class AuditLogCreate(BaseModel):
+class AuditLogResponse(BaseModel):
+    id: int
     user_id: str
     action: str
     target_device: Optional[str] = None
-    commands: Optional[dict] = None
-    approval_id: Optional[str] = None
-    status: Optional[str] = "success"
-
-
-class AuditLogUpdate(BaseModel):
-    action: Optional[str] = None
-    target_device: Optional[str] = None
-    commands: Optional[dict] = None
+    commands: Optional[list] = None
+    timestamp: Optional[str] = None
     approval_id: Optional[str] = None
     status: Optional[str] = None
+    security_type: Optional[str] = None
+    prompt_tokens: Optional[int] = None
+    completion_tokens: Optional[int] = None
+    latency_ms: Optional[int] = None
+    raw_prompt: Optional[str] = None
+    raw_response: Optional[str] = None
+
+    class Config:
+        from_attributes = True
 
 
-@router.get("/")
+class AuditLogListResponse(BaseModel):
+    data: list[AuditLogResponse]
+    total: int
+    page: int
+    limit: int
+
+
+@router.get("", response_model=AuditLogListResponse)
 async def list_audit_logs(
-    user_id: Optional[str] = Query(None),
-    action: Optional[str] = Query(None),
-    target_device: Optional[str] = Query(None),
-    status: Optional[str] = Query(None),
-    start_time: Optional[str] = Query(None, description="ISO格式开始时间"),
-    end_time: Optional[str] = Query(None, description="ISO格式结束时间"),
-    skip: int = Query(0, ge=0),
+    page: int = Query(1, ge=1),
     limit: int = Query(20, ge=1, le=100),
+    user: Optional[str] = Query(None),
+    action: Optional[str] = Query(None),
+    status: Optional[str] = Query(None),
+    security_type: Optional[str] = Query(None),
+    start_date: Optional[str] = Query(None),
+    end_date: Optional[str] = Query(None),
     db: AsyncSession = Depends(get_db_session),
-    current_user=Depends(get_current_user),
+    current_user: dict = Depends(get_current_user),
+    _: None = Depends(requires_permission("audit:read")),
 ):
     query = select(AuditLog)
-    if user_id:
-        query = query.where(AuditLog.user_id == user_id)
+    count_query = select(func.count(AuditLog.id))
+
+    if user:
+        query = query.where(AuditLog.user_id == user)
+        count_query = count_query.where(AuditLog.user_id == user)
     if action:
         query = query.where(AuditLog.action == action)
-    if target_device:
-        query = query.where(AuditLog.target_device == target_device)
+        count_query = count_query.where(AuditLog.action == action)
     if status:
         query = query.where(AuditLog.status == status)
-    if start_time:
-        query = query.where(AuditLog.timestamp >= datetime.fromisoformat(start_time))
-    if end_time:
-        query = query.where(AuditLog.timestamp <= datetime.fromisoformat(end_time))
-    query = query.order_by(AuditLog.timestamp.desc()).offset(skip).limit(limit)
+        count_query = count_query.where(AuditLog.status == status)
+    if security_type:
+        query = query.where(AuditLog.security_type == security_type)
+        count_query = count_query.where(AuditLog.security_type == security_type)
+    if start_date:
+        query = query.where(AuditLog.timestamp >= start_date)
+        count_query = count_query.where(AuditLog.timestamp >= start_date)
+    if end_date:
+        query = query.where(AuditLog.timestamp <= end_date + " 23:59:59")
+        count_query = count_query.where(AuditLog.timestamp <= end_date + " 23:59:59")
+
+    total_result = await db.execute(count_query)
+    total = total_result.scalar() or 0
+
+    offset = (page - 1) * limit
+    query = query.order_by(desc(AuditLog.timestamp)).offset(offset).limit(limit)
     result = await db.execute(query)
     logs = result.scalars().all()
-    return {"status": "success", "data": [
-        {"id": l.id, "user_id": l.user_id, "action": l.action,
-         "target_device": l.target_device, "commands": l.commands,
-         "timestamp": l.timestamp.isoformat() if l.timestamp else None,
-         "approval_id": l.approval_id, "status": l.status}
-        for l in logs
-    ]}
+
+    return AuditLogListResponse(
+        data=[AuditLogResponse(
+            id=log.id,
+            user_id=log.user_id,
+            action=log.action,
+            target_device=log.target_device,
+            commands=log.commands,
+            timestamp=log.timestamp.isoformat() if log.timestamp else None,
+            approval_id=log.approval_id,
+            status=log.status,
+            security_type=log.security_type,
+            prompt_tokens=log.prompt_tokens,
+            completion_tokens=log.completion_tokens,
+            latency_ms=log.latency_ms,
+            raw_prompt=log.raw_prompt,
+            raw_response=log.raw_response,
+        ) for log in logs],
+        total=total,
+        page=page,
+        limit=limit,
+    )
 
 
-@router.get("/{log_id}")
+@router.get("/stats")
+async def get_audit_stats(
+    db: AsyncSession = Depends(get_db_session),
+    current_user: dict = Depends(get_current_user),
+    _: None = Depends(requires_permission("audit:read")),
+):
+    # Check cache first (30s TTL for stats)
+    cached_stats = api_cache.get("audit_stats")
+    if cached_stats is not None:
+        return cached_stats
+
+    # Single aggregated query instead of 5 separate COUNT queries
+    stmt = select(
+        func.count(AuditLog.id).label("total"),
+        func.sum(case((AuditLog.security_type == "critical", 1), else_=0)).label("critical"),
+        func.sum(case((AuditLog.security_type == "warning", 1), else_=0)).label("warning"),
+        func.sum(case((AuditLog.status == "success", 1), else_=0)).label("success"),
+        func.sum(case((AuditLog.status == "failed", 1), else_=0)).label("failed"),
+    )
+    row = (await db.execute(stmt)).one()
+
+    result = {
+        "total": row.total or 0,
+        "critical": row.critical or 0,
+        "warning": row.warning or 0,
+        "success": row.success or 0,
+        "failed": row.failed or 0,
+    }
+
+    api_cache.set("audit_stats", result, ttl_seconds=30)
+    return result
+
+
+@router.get("/{log_id}", response_model=AuditLogResponse)
 async def get_audit_log(
     log_id: int,
     db: AsyncSession = Depends(get_db_session),
-    current_user=Depends(get_current_user),
+    current_user: dict = Depends(get_current_user),
+    _: None = Depends(requires_permission("audit:read")),
 ):
     result = await db.execute(select(AuditLog).where(AuditLog.id == log_id))
     log = result.scalar_one_or_none()
     if not log:
         raise HTTPException(status_code=404, detail="Audit log not found")
-    return {"status": "success", "data": {
-        "id": log.id, "user_id": log.user_id, "action": log.action,
-        "target_device": log.target_device, "commands": log.commands,
-        "timestamp": log.timestamp.isoformat() if log.timestamp else None,
-        "approval_id": log.approval_id, "status": log.status,
-    }}
 
-
-@router.post("/")
-async def create_audit_log(
-    req: AuditLogCreate,
-    db: AsyncSession = Depends(get_db_session),
-    current_user=Depends(get_current_user),
-):
-    log = AuditLog(
-        user_id=req.user_id, action=req.action,
-        target_device=req.target_device, commands=req.commands,
-        approval_id=req.approval_id, status=req.status,
+    return AuditLogResponse(
+        id=log.id,
+        user_id=log.user_id,
+        action=log.action,
+        target_device=log.target_device,
+        commands=log.commands,
+        timestamp=log.timestamp.isoformat() if log.timestamp else None,
+        approval_id=log.approval_id,
+        status=log.status,
+        security_type=log.security_type,
+        prompt_tokens=log.prompt_tokens,
+        completion_tokens=log.completion_tokens,
+        latency_ms=log.latency_ms,
+        raw_prompt=log.raw_prompt,
+        raw_response=log.raw_response,
     )
-    db.add(log)
-    await db.commit()
-    await db.refresh(log)
-    return {"status": "success", "data": {"id": log.id}}
-
-
-@router.put("/{log_id}")
-async def update_audit_log(
-    log_id: int,
-    req: AuditLogUpdate,
-    db: AsyncSession = Depends(get_db_session),
-    current_user=Depends(get_current_user),
-):
-    result = await db.execute(select(AuditLog).where(AuditLog.id == log_id))
-    log = result.scalar_one_or_none()
-    if not log:
-        raise HTTPException(status_code=404, detail="Audit log not found")
-    if req.action is not None:
-        log.action = req.action
-    if req.target_device is not None:
-        log.target_device = req.target_device
-    if req.commands is not None:
-        log.commands = req.commands
-    if req.approval_id is not None:
-        log.approval_id = req.approval_id
-    if req.status is not None:
-        log.status = req.status
-    await db.commit()
-    return {"status": "success", "data": {"id": log.id}}
-
-
-@router.delete("/{log_id}")
-async def delete_audit_log(
-    log_id: int,
-    db: AsyncSession = Depends(get_db_session),
-    current_user=Depends(get_current_user),
-):
-    result = await db.execute(select(AuditLog).where(AuditLog.id == log_id))
-    log = result.scalar_one_or_none()
-    if not log:
-        raise HTTPException(status_code=404, detail="Audit log not found")
-    await db.delete(log)
-    await db.commit()
-    return {"status": "success", "message": "Deleted"}
-
-
-@router.get("/stats/summary")
-async def audit_stats(
-    db: AsyncSession = Depends(get_db_session),
-    current_user=Depends(get_current_user),
-):
-    total_result = await db.execute(select(func.count(AuditLog.id)))
-    total = total_result.scalar() or 0
-    by_action_result = await db.execute(
-        select(AuditLog.action, func.count(AuditLog.id)).group_by(AuditLog.action)
-    )
-    by_action = {row[0]: row[1] for row in by_action_result.all()}
-    by_status_result = await db.execute(
-        select(AuditLog.status, func.count(AuditLog.id)).group_by(AuditLog.status)
-    )
-    by_status = {row[0]: row[1] for row in by_status_result.all()}
-    return {"status": "success", "data": {
-        "total": total, "by_action": by_action, "by_status": by_status,
-    }}
-
-
-@router.get("/export/csv")
-async def export_audit_logs(
-    user_id: Optional[str] = Query(None),
-    action: Optional[str] = Query(None),
-    start_time: Optional[str] = Query(None),
-    end_time: Optional[str] = Query(None),
-    db: AsyncSession = Depends(get_db_session),
-    current_user=Depends(get_current_user),
-):
-    query = select(AuditLog)
-    if user_id:
-        query = query.where(AuditLog.user_id == user_id)
-    if action:
-        query = query.where(AuditLog.action == action)
-    if start_time:
-        query = query.where(AuditLog.timestamp >= datetime.fromisoformat(start_time))
-    if end_time:
-        query = query.where(AuditLog.timestamp <= datetime.fromisoformat(end_time))
-    query = query.order_by(AuditLog.timestamp.desc()).limit(1000)
-    result = await db.execute(query)
-    logs = result.scalars().all()
-    lines = ["id,user_id,action,target_device,timestamp,approval_id,status"]
-    for l in logs:
-        lines.append(f'{l.id},{l.user_id},{l.action},{l.target_device or ""},{l.timestamp.isoformat() if l.timestamp else ""},{l.approval_id or ""},{l.status}')
-    csv_content = "\n".join(lines)
-    return {"status": "success", "data": {"csv": csv_content, "count": len(logs)}}

@@ -1,139 +1,124 @@
-"""语义路由器 - 基于关键词匹配的跨域意图路由，轻量级实现（不依赖外部ML模型）"""
-
+from typing import Dict, List, Optional
+from pydantic import BaseModel
+from backend.cross_domain.registry import registry_center, AgentRegistration
 import logging
-from dataclasses import dataclass, field
 
 logger = logging.getLogger(__name__)
 
+KEYWORD_CAPABILITY_MAP = {
+    "qos_config": ["QoS", "带宽", "流量", "限速", "队列", "调度", "bandwidth", "traffic", "rate"],
+    "event_diagnosis": ["故障", "诊断", "自愈", "告警", "异常", "中断", "fault", "diagnosis", "alert", "healing"],
+    "policy_planning": ["路由", "策略", "规划", "优化", "负载均衡", "routing", "policy", "optimization"],
+    "execution": ["配置", "执行", "下发", "部署", "变更", "commit", "deploy", "execute", "configure"],
+    "intent_parsing": ["意图", "解析", "理解", "转换", "intent", "parse", "understand"],
+}
 
-@dataclass
-class RouteRule:
-    """路由规则"""
-    pattern: str
-    handler: str
-    priority: int = 0
 
-    def matches(self, intent: str) -> bool:
-        """检查意图是否匹配此规则（关键词包含匹配）"""
-        return self.pattern in intent
+class RoutingDecision(BaseModel):
+    selected_agent: Optional[AgentRegistration] = None
+    matched_capabilities: List[str] = []
+    capability_scores: Dict[str, float] = {}
+    load_score: float = 0.0
+    total_score: float = 0.0
+    explanation: str = ""
+    candidates_count: int = 0
 
 
 class SemanticRouter:
-    """语义路由器 - 根据意图关键词路由到目标Agent
+    def __init__(self):
+        self._keyword_map = KEYWORD_CAPABILITY_MAP
 
-    轻量级实现，基于关键词包含匹配，不依赖外部ML模型。
-    支持多Agent匹配和优先级排序。
-    """
+    def _extract_capabilities(self, intent_text: str) -> Dict[str, float]:
+        scores: Dict[str, float] = {}
+        intent_lower = intent_text.lower()
+        for capability, keywords in self._keyword_map.items():
+            match_count = 0
+            for keyword in keywords:
+                if keyword.lower() in intent_lower:
+                    match_count += 1
+            if match_count > 0:
+                scores[capability] = min(match_count / len(keywords) + 0.3 * match_count, 1.0)
+        return scores
 
-    def __init__(self) -> None:
-        self._routes: list[RouteRule] = []
-        self._register_default_routes()
-        logger.info("语义路由器初始化完成，已注册 %d 条默认路由", len(self._routes))
+    def route_intent(self, intent_text: str, required_capabilities: Optional[List[str]] = None) -> Optional[AgentRegistration]:
+        capability_scores = self._extract_capabilities(intent_text)
 
-    def _register_default_routes(self) -> None:
-        """注册README中定义的9种意图路由"""
-        default_routes = [
-            # 带宽保障 → PolicyPlanner
-            ("带宽保障", "PolicyPlanner", 5),
-            # 流量调度 → PolicyPlanner
-            ("流量调度", "PolicyPlanner", 5),
-            # 故障自愈 → ExecutionAgent, GrayscaleHealing
-            ("故障自愈", "ExecutionAgent", 5),
-            ("故障自愈", "GrayscaleHealing", 4),
-            # 安全策略 → SecurityAgent
-            ("安全策略", "SecurityAgent", 5),
-            # QoS优化 → PolicyPlanner
-            ("QoS优化", "PolicyPlanner", 5),
-            # 链路保护 → PolicyPlanner
-            ("链路保护", "PolicyPlanner", 5),
-            # 负载均衡 → PolicyPlanner
-            ("负载均衡", "PolicyPlanner", 5),
-            # 访问控制 → SecurityAgent
-            ("访问控制", "SecurityAgent", 5),
-            # 路由优化 → PolicyPlanner
-            ("路由优化", "PolicyPlanner", 5),
-        ]
-        for pattern, handler, priority in default_routes:
-            self._routes.append(RouteRule(pattern=pattern, handler=handler, priority=priority))
+        if required_capabilities:
+            for cap in required_capabilities:
+                if cap not in capability_scores:
+                    capability_scores[cap] = 0.5
 
-    def register_route(self, pattern: str, handler: str, priority: int = 0) -> None:
-        """注册路由规则
+        if not capability_scores:
+            return registry_center.get_least_loaded()
 
-        Args:
-            pattern: 意图关键词模式（如"故障自愈"、"带宽保障"）
-            handler: 目标Agent ID
-            priority: 优先级（数字越大优先级越高）
-        """
-        rule = RouteRule(pattern=pattern, handler=handler, priority=priority)
-        self._routes.append(rule)
-        logger.info("路由规则注册: pattern='%s' → handler='%s', priority=%d", pattern, handler, priority)
+        target_capability = max(capability_scores, key=capability_scores.get)
+        agents = registry_center.discover(capabilities=[target_capability])
 
-    async def route(self, intent: str, context: dict = None) -> list[str]:
-        """根据意图路由到目标Agent
+        if not agents:
+            all_agents = registry_center.discover()
+            if all_agents:
+                return min(all_agents, key=lambda a: a.cpu_load)
+            return None
 
-        Args:
-            intent: 用户意图文本
-            context: 可选的上下文信息（预留扩展用）
+        best_agent = None
+        best_score = -1.0
+        for agent in agents:
+            cap_score = sum(capability_scores.get(c, 0.0) for c in agent.capabilities) / max(len(agent.capabilities), 1)
+            load_score = max(0.0, 1.0 - agent.cpu_load / 100.0)
+            total_score = cap_score * 0.7 + load_score * 0.3
+            if total_score > best_score:
+                best_score = total_score
+                best_agent = agent
 
-        Returns:
-            匹配的Agent ID列表（按优先级降序排序）
-        """
-        matched: list[RouteRule] = []
-        for rule in self._routes:
-            if rule.matches(intent):
-                matched.append(rule)
+        return best_agent
 
-        # 按优先级降序排序
-        matched.sort(key=lambda r: r.priority, reverse=True)
+    def explain_routing(self, intent_text: str, required_capabilities: Optional[List[str]] = None) -> RoutingDecision:
+        capability_scores = self._extract_capabilities(intent_text)
 
-        # 提取Agent ID（去重，保持优先级顺序）
-        seen: set[str] = set()
-        result: list[str] = []
-        for rule in matched:
-            if rule.handler not in seen:
-                seen.add(rule.handler)
-                result.append(rule.handler)
+        if required_capabilities:
+            for cap in required_capabilities:
+                if cap not in capability_scores:
+                    capability_scores[cap] = 0.5
 
-        if result:
-            logger.info("意图 '%s' 路由到: %s", intent, result)
+        matched_capabilities = sorted(capability_scores.keys(), key=lambda k: capability_scores[k], reverse=True)
+
+        selected_agent = self.route_intent(intent_text, required_capabilities)
+        candidates_count = 0
+        load_score = 0.0
+        total_score = 0.0
+
+        if selected_agent:
+            cap_score = sum(capability_scores.get(c, 0.0) for c in selected_agent.capabilities) / max(len(selected_agent.capabilities), 1)
+            load_score = max(0.0, 1.0 - selected_agent.cpu_load / 100.0)
+            total_score = cap_score * 0.7 + load_score * 0.3
+            target_cap = matched_capabilities[0] if matched_capabilities else None
+            if target_cap:
+                candidates = registry_center.discover(capabilities=[target_cap])
+                candidates_count = len(candidates)
+
+        explanation_parts = []
+        if matched_capabilities:
+            explanation_parts.append(f"意图文本匹配到能力: {', '.join(matched_capabilities)}")
         else:
-            logger.warning("意图 '%s' 无匹配路由", intent)
+            explanation_parts.append("意图文本未匹配到特定能力，将按负载均衡选择")
 
-        return result
-
-    def get_routes(self) -> list[dict]:
-        """获取所有路由规则
-
-        Returns:
-            路由规则列表，每项包含 pattern、handler、priority
-        """
-        return [
-            {
-                "pattern": rule.pattern,
-                "handler": rule.handler,
-                "priority": rule.priority,
-            }
-            for rule in self._routes
-        ]
-
-    def remove_route(self, pattern: str, handler: str) -> bool:
-        """删除路由规则
-
-        Args:
-            pattern: 意图关键词模式
-            handler: 目标Agent ID
-
-        Returns:
-            是否成功删除（True=已删除，False=未找到匹配规则）
-        """
-        original_len = len(self._routes)
-        self._routes = [
-            r for r in self._routes
-            if not (r.pattern == pattern and r.handler == handler)
-        ]
-        removed = len(self._routes) < original_len
-        if removed:
-            logger.info("路由规则删除: pattern='%s' → handler='%s'", pattern, handler)
+        if selected_agent:
+            explanation_parts.append(f"选择Agent: {selected_agent.agent_id}")
+            explanation_parts.append(f"能力匹配分数: {total_score:.2f} (能力权重0.7, 负载权重0.3)")
+            explanation_parts.append(f"负载评分: {load_score:.2f} (CPU: {selected_agent.cpu_load}%)")
+            explanation_parts.append(f"候选Agent数: {candidates_count}")
         else:
-            logger.warning("未找到匹配路由规则: pattern='%s' → handler='%s'", pattern, handler)
-        return removed
+            explanation_parts.append("未找到可用Agent")
+
+        return RoutingDecision(
+            selected_agent=selected_agent,
+            matched_capabilities=matched_capabilities,
+            capability_scores=capability_scores,
+            load_score=load_score,
+            total_score=total_score,
+            explanation="; ".join(explanation_parts),
+            candidates_count=candidates_count,
+        )
+
+
+semantic_router = SemanticRouter()

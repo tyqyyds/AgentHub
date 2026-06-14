@@ -1,53 +1,112 @@
 import { defineStore } from 'pinia'
 import { ref, computed } from 'vue'
+import { apiClient, api } from '@/utils/apiClient'
+import { useLogger } from '@/utils/logger'
+import { showToast } from '@/utils/toast'
+import { auditLogService } from '@/utils/auditLogService'
+import { useAuthStore } from '@/stores/auth'
 
-interface BreadcrumbItem {
-  title: string
-  path?: string
+const { error: logError } = useLogger()
+
+export interface AppState {
+  loading: boolean
+  sidebarCollapsed: boolean
+  currentRoute: string
+  fuseEnabled: boolean
+  fuseReason: string
+  showFuseConfirm: boolean
+  fuseConfirmAction: 'enable' | 'disable'
+  fuseBannerVisible: boolean
 }
 
-type ThemeMode = 'light' | 'dark'
-
 export const useAppStore = defineStore('app', () => {
-  // 从 localStorage 恢复持久化状态
-  const sidebarCollapsed = ref<boolean>(
-    localStorage.getItem('sidebar_collapsed') === 'true'
-  )
-  const theme = ref<ThemeMode>(
-    (localStorage.getItem('theme') as ThemeMode) || 'light'
-  )
-  const breadcrumbs = ref<BreadcrumbItem[]>([])
   const loading = ref(false)
+  const sidebarCollapsed = ref(false)
+  const currentRoute = ref('Dashboard')
+  const fuseEnabled = ref(false)
+  const fuseReason = ref('')
+  const showFuseConfirm = ref(false)
+  const fuseConfirmAction = ref<'enable' | 'disable'>('enable')
+  const fuseBannerVisible = ref(true)
 
-  const isDark = computed(() => theme.value === 'dark')
+  const isFused = computed(() => fuseEnabled.value)
 
-  function toggleSidebar() {
-    sidebarCollapsed.value = !sidebarCollapsed.value
-    localStorage.setItem('sidebar_collapsed', String(sidebarCollapsed.value))
+  const setLoading = (value: boolean) => { loading.value = value }
+  const toggleSidebar = () => { sidebarCollapsed.value = !sidebarCollapsed.value }
+  const setCurrentRoute = (route: string) => { currentRoute.value = route }
+
+  const fetchFuseStatus = async () => {
+    try {
+      const result = await apiClient.get(api.system.fuseStatus)
+      const data = result.data
+      if (data && typeof data.fuse_enabled === 'boolean') {
+        const wasEnabled = fuseEnabled.value
+        fuseEnabled.value = data.fuse_enabled
+        fuseReason.value = data.fuse_reason || ''
+        if (data.fuse_enabled && !wasEnabled) { fuseBannerVisible.value = true }
+      }
+    } catch (err: unknown) {
+      if (err instanceof Error) logError('获取熔断状态失败', { error: err.message })
+    }
   }
 
-  function setTheme(mode: ThemeMode) {
-    theme.value = mode
-    localStorage.setItem('theme', mode)
+  const requestFuseToggle = () => {
+    fuseConfirmAction.value = fuseEnabled.value ? 'disable' : 'enable'
+    showFuseConfirm.value = true
   }
 
-  function setBreadcrumbs(items: BreadcrumbItem[]) {
-    breadcrumbs.value = items
+  const dismissFuseConfirm = () => { showFuseConfirm.value = false }
+
+  const confirmFuseAction = async () => {
+    showFuseConfirm.value = false
+    const enabling = fuseConfirmAction.value === 'enable'
+    const authStore = useAuthStore()
+    try {
+      setLoading(true)
+      const result = await apiClient.post(api.system.fuse, {
+        enable: enabling,
+        reason: enabling ? '用户手动触发紧急熔断' : ''
+      })
+      const data = result.data
+      if (data && typeof data.fuse_enabled === 'boolean') {
+        fuseEnabled.value = data.fuse_enabled
+        fuseReason.value = data.fuse_reason || ''
+        if (fuseEnabled.value) {
+          showToast('⚠️ 系统已进入紧急熔断状态！所有自动操作已暂停。', 'error')
+          fuseBannerVisible.value = true
+          auditLogService.recordSecurityAlert(authStore.userRole || 'unknown', '紧急熔断触发', 'critical', '用户手动触发紧急熔断')
+        } else {
+          showToast('✅ 系统熔断已解除，正常运行中。', 'success')
+          auditLogService.recordSecurityAlert(authStore.userRole || 'unknown', '紧急熔断解除', 'info', '用户手动解除紧急熔断')
+        }
+      }
+    } catch (err: unknown) {
+      if (err instanceof Error) logError('切换熔断状态失败', { error: err.message })
+      showToast('熔断操作失败，请重试', 'error')
+    } finally {
+      setLoading(false)
+    }
   }
 
-  function setLoading(state: boolean) {
-    loading.value = state
+  const dismissFuseBanner = () => { fuseBannerVisible.value = false }
+
+  const reset = () => {
+    loading.value = false
+    sidebarCollapsed.value = false
+    currentRoute.value = 'Dashboard'
+    fuseEnabled.value = false
+    fuseReason.value = ''
+    showFuseConfirm.value = false
+    fuseConfirmAction.value = 'enable'
+    fuseBannerVisible.value = true
   }
 
   return {
-    sidebarCollapsed,
-    theme,
-    breadcrumbs,
-    loading,
-    isDark,
-    toggleSidebar,
-    setTheme,
-    setBreadcrumbs,
-    setLoading
+    loading, sidebarCollapsed, currentRoute, fuseEnabled, fuseReason,
+    showFuseConfirm, fuseConfirmAction, fuseBannerVisible,
+    isFused,
+    setLoading, toggleSidebar, setCurrentRoute,
+    fetchFuseStatus, requestFuseToggle, dismissFuseConfirm, confirmFuseAction, dismissFuseBanner,
+    reset
   }
 })

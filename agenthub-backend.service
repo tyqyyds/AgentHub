@@ -1,0 +1,17 @@
+[Unit]
+Description=AgentHub Backend API Service
+After=network.target
+
+[Service]
+Type=simple
+User=root
+WorkingDirectory=/opt/agenthub
+Environment=PYTHONPATH=/opt/agenthub:/opt/agenthub/backend
+ExecStart=/opt/agenthub/venv/bin/uvicorn backend.api.main:app --host 0.0.0.0 --port 8000
+Restart=always
+RestartSec=5
+StandardOutput=journal
+StandardError=journal
+
+[Install]
+WantedBy=multi-user.target

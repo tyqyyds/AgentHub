@@ -1,143 +1,154 @@
-from fastapi import APIRouter, Depends, HTTPException, Query
-from sqlalchemy.ext.asyncio import AsyncSession
-from sqlalchemy import select
-from pydantic import BaseModel
-from typing import Optional
-from ..database.connection import get_db_session
-from ..database.models import LLMRouterConfig, LLMProvider
-from .deps import get_current_user
+from fastapi import APIRouter, HTTPException
+from pydantic import BaseModel, field_validator
+from backend.agents.llm_router import get_llm_router
+from backend.core.security.rbac import get_current_user, requires_permission
+from backend.api.response import success_response
+from fastapi import Depends
+import logging
+
+logger = logging.getLogger(__name__)
 
 router = APIRouter()
 
 
-class LLMRouterCreate(BaseModel):
-    task_type: str
-    primary_provider: str
-    fallback_provider: Optional[str] = None
-    primary_model: str
-    fallback_model: Optional[str] = None
-    temperature: Optional[float] = 0.7
-    max_tokens: Optional[int] = 2048
+class ProviderCreateRequest(BaseModel):
+    name: str
+    api_url: str
+    api_key: str
+    model: str
+    max_tokens: int = 4096
+    cost_per_1k_input: float = 0.0
+    cost_per_1k_output: float = 0.0
+    supports_streaming: bool = True
+    supports_function_calling: bool = False
+    enabled: bool = True
+
+    @field_validator("name")
+    @classmethod
+    def name_not_empty(cls, v):
+        if not v or not v.strip():
+            raise ValueError("name cannot be empty")
+        return v
+
+    @field_validator("api_url")
+    @classmethod
+    def api_url_not_empty(cls, v):
+        if not v or not v.strip():
+            raise ValueError("api_url cannot be empty")
+        return v
+
+    @field_validator("model")
+    @classmethod
+    def model_not_empty(cls, v):
+        if not v or not v.strip():
+            raise ValueError("model cannot be empty")
+        return v
 
 
-class LLMRouterUpdate(BaseModel):
-    task_type: Optional[str] = None
-    primary_provider: Optional[str] = None
-    fallback_provider: Optional[str] = None
-    primary_model: Optional[str] = None
-    fallback_model: Optional[str] = None
-    temperature: Optional[float] = None
-    max_tokens: Optional[int] = None
-    is_active: Optional[bool] = None
+class ProviderUpdateRequest(BaseModel):
+    api_url: str = None
+    api_key: str = None
+    model: str = None
+    max_tokens: int = None
+    cost_per_1k_input: float = None
+    cost_per_1k_output: float = None
+    supports_streaming: bool = None
+    supports_function_calling: bool = None
+    enabled: bool = None
 
 
-@router.get("/")
-async def list_llm_configs(
-    task_type: Optional[str] = Query(None),
-    skip: int = Query(0, ge=0),
-    limit: int = Query(20, ge=1, le=100),
-    db: AsyncSession = Depends(get_db_session),
+@router.get("/providers")
+async def list_providers(current_user=Depends(get_current_user)):
+    llm_router = get_llm_router()
+    return success_response(data=llm_router.get_provider_status())
+
+
+@router.post("/providers")
+async def register_provider(
+    provider: ProviderCreateRequest,
     current_user=Depends(get_current_user),
+    _: None = Depends(requires_permission("llm-router:manage")),
 ):
-    query = select(LLMRouterConfig)
-    if task_type:
-        query = query.where(LLMRouterConfig.task_type == task_type)
-    query = query.offset(skip).limit(limit)
-    result = await db.execute(query)
-    configs = result.scalars().all()
-    return {"status": "success", "data": [{"id": c.id, "task_type": c.task_type, "primary_provider": c.primary_provider.value if c.primary_provider else None, "fallback_provider": c.fallback_provider.value if c.fallback_provider else None, "primary_model": c.primary_model, "fallback_model": c.fallback_model, "temperature": c.temperature, "max_tokens": c.max_tokens, "is_active": c.is_active} for c in configs]}
+    llm_router = get_llm_router()
+    try:
+        config = llm_router.register_provider(provider.model_dump())
+        return success_response(data={
+                "name": config.name,
+                "model": config.model,
+                "enabled": config.enabled,
+                "available": config.available,
+            })
+    except ValueError as e:
+        raise HTTPException(status_code=400, detail=str(e))
+    except Exception as e:
+        logger.error(f"Register provider failed: {e}", exc_info=True)
+        raise HTTPException(status_code=500, detail="Internal server error")
 
 
-@router.get("/{config_id}")
-async def get_llm_config(
-    config_id: int,
-    db: AsyncSession = Depends(get_db_session),
+@router.put("/providers/{name}")
+async def update_provider(
+    name: str,
+    provider: ProviderUpdateRequest,
     current_user=Depends(get_current_user),
+    _: None = Depends(requires_permission("llm-router:manage")),
 ):
-    result = await db.execute(select(LLMRouterConfig).where(LLMRouterConfig.id == config_id))
-    config = result.scalar_one_or_none()
+    llm_router = get_llm_router()
+    updates = {k: v for k, v in provider.model_dump().items() if v is not None}
+    if not updates:
+        raise HTTPException(status_code=400, detail="No fields to update")
+
+    config = llm_router.update_provider(name, updates)
     if not config:
-        raise HTTPException(status_code=404, detail="LLM router config not found")
-    return {"status": "success", "data": {"id": config.id, "task_type": config.task_type, "primary_provider": config.primary_provider.value if config.primary_provider else None, "fallback_provider": config.fallback_provider.value if config.fallback_provider else None, "primary_model": config.primary_model, "fallback_model": config.fallback_model, "temperature": config.temperature, "max_tokens": config.max_tokens, "is_active": config.is_active}}
+        raise HTTPException(status_code=404, detail=f"Provider '{name}' not found")
+
+    return success_response(data={
+            "name": config.name,
+            "model": config.model,
+            "enabled": config.enabled,
+            "available": config.available,
+        })
 
 
-@router.post("/")
-async def create_llm_config(
-    req: LLMRouterCreate,
-    db: AsyncSession = Depends(get_db_session),
+@router.delete("/providers/{name}")
+async def delete_provider(
+    name: str,
     current_user=Depends(get_current_user),
+    _: None = Depends(requires_permission("llm-router:manage")),
 ):
-    config = LLMRouterConfig(
-        task_type=req.task_type,
-        primary_provider=LLMProvider(req.primary_provider),
-        fallback_provider=LLMProvider(req.fallback_provider) if req.fallback_provider else None,
-        primary_model=req.primary_model,
-        fallback_model=req.fallback_model,
-        temperature=req.temperature,
-        max_tokens=req.max_tokens,
-    )
-    db.add(config)
-    await db.commit()
-    await db.refresh(config)
-    return {"status": "success", "data": {"id": config.id}}
+    llm_router = get_llm_router()
+    removed = llm_router.remove_provider(name)
+    if not removed:
+        raise HTTPException(status_code=404, detail=f"Provider '{name}' not found")
+    return success_response()
 
 
-@router.put("/{config_id}")
-async def update_llm_config(
-    config_id: int,
-    req: LLMRouterUpdate,
-    db: AsyncSession = Depends(get_db_session),
+@router.post("/providers/{name}/toggle")
+async def toggle_provider(
+    name: str,
     current_user=Depends(get_current_user),
+    _: None = Depends(requires_permission("llm-router:manage")),
 ):
-    result = await db.execute(select(LLMRouterConfig).where(LLMRouterConfig.id == config_id))
-    config = result.scalar_one_or_none()
+    llm_router = get_llm_router()
+    config = llm_router.toggle_provider(name)
     if not config:
-        raise HTTPException(status_code=404, detail="LLM router config not found")
-    if req.task_type is not None:
-        config.task_type = req.task_type
-    if req.primary_provider is not None:
-        config.primary_provider = LLMProvider(req.primary_provider)
-    if req.fallback_provider is not None:
-        config.fallback_provider = LLMProvider(req.fallback_provider)
-    if req.primary_model is not None:
-        config.primary_model = req.primary_model
-    if req.fallback_model is not None:
-        config.fallback_model = req.fallback_model
-    if req.temperature is not None:
-        config.temperature = req.temperature
-    if req.max_tokens is not None:
-        config.max_tokens = req.max_tokens
-    if req.is_active is not None:
-        config.is_active = req.is_active
-    await db.commit()
-    return {"status": "success", "data": {"id": config.id}}
+        raise HTTPException(status_code=404, detail=f"Provider '{name}' not found")
+    return success_response(data={
+            "name": config.name,
+            "enabled": config.enabled,
+            "available": config.available,
+        })
 
 
-@router.delete("/{config_id}")
-async def delete_llm_config(
-    config_id: int,
-    db: AsyncSession = Depends(get_db_session),
+@router.get("/recommendations/{task_type}")
+async def get_recommendations(
+    task_type: str,
     current_user=Depends(get_current_user),
 ):
-    result = await db.execute(select(LLMRouterConfig).where(LLMRouterConfig.id == config_id))
-    config = result.scalar_one_or_none()
-    if not config:
-        raise HTTPException(status_code=404, detail="LLM router config not found")
-    await db.delete(config)
-    await db.commit()
-    return {"status": "success", "message": "Deleted"}
+    llm_router = get_llm_router()
+    return success_response(data=llm_router.get_recommendations(task_type))
 
 
-@router.post("/route")
-async def route_llm_request(
-    task_type: str = Query(..., description="Task type to route"),
-    db: AsyncSession = Depends(get_db_session),
-    current_user=Depends(get_current_user),
-):
-    result = await db.execute(
-        select(LLMRouterConfig).where(LLMRouterConfig.task_type == task_type, LLMRouterConfig.is_active == True)
-    )
-    config = result.scalar_one_or_none()
-    if not config:
-        raise HTTPException(status_code=404, detail=f"No active LLM router config for task type: {task_type}")
-    return {"status": "success", "data": {"primary_provider": config.primary_provider.value, "primary_model": config.primary_model, "fallback_provider": config.fallback_provider.value if config.fallback_provider else None, "fallback_model": config.fallback_model, "temperature": config.temperature, "max_tokens": config.max_tokens}}
+@router.get("/metrics")
+async def get_metrics(current_user=Depends(get_current_user)):
+    llm_router = get_llm_router()
+    return success_response(data=llm_router.get_metrics())

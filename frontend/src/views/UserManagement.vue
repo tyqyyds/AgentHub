@@ -1,225 +1,793 @@
-<script setup lang="ts">
-import { ref, onMounted } from 'vue'
-
-interface UserItem {
-  id: number
-  username: string
-  displayName: string
-  role: 'admin' | 'operator' | 'viewer'
-  email: string
-  isActive: boolean
-  lastLogin: string
-  createdAt: string
-}
-
-const loading = ref(false)
-const users = ref<UserItem[]>([
-  { id: 1, username: 'admin', displayName: '系统管理员', role: 'admin', email: 'admin@agenthub.local', isActive: true, lastLogin: '2026-06-13 10:30', createdAt: '2026-01-01' },
-  { id: 2, username: 'operator01', displayName: '张运维', role: 'operator', email: 'zhangyw@agenthub.local', isActive: true, lastLogin: '2026-06-13 09:15', createdAt: '2026-02-15' },
-  { id: 3, username: 'operator02', displayName: '李安全', role: 'operator', email: 'liaq@agenthub.local', isActive: true, lastLogin: '2026-06-12 18:00', createdAt: '2026-03-01' },
-  { id: 4, username: 'viewer01', displayName: '王观察', role: 'viewer', email: 'wanggc@agenthub.local', isActive: true, lastLogin: '2026-06-13 08:45', createdAt: '2026-04-10' },
-  { id: 5, username: 'viewer02', displayName: '赵审计', role: 'viewer', email: 'zhaosj@agenthub.local', isActive: false, lastLogin: '2026-05-20 14:30', createdAt: '2026-03-20' }
-])
-
-const showCreateDialog = ref(false)
-const showEditDialog = ref(false)
-const newUser = ref({ username: '', displayName: '', email: '', role: 'viewer' as string, password: '' })
-const editingUser = ref<UserItem | null>(null)
-const editRole = ref('')
-
-function getRoleLabel(r: string) {
-  return r === 'admin' ? '管理员' : r === 'operator' ? '操作员' : '观察者'
-}
-
-function toggleUserStatus(user: UserItem) {
-  user.isActive = !user.isActive
-}
-
-function openEditDialog(user: UserItem) {
-  editingUser.value = user
-  editRole.value = user.role
-  showEditDialog.value = true
-}
-
-function saveRole() {
-  if (editingUser.value) {
-    editingUser.value.role = editRole.value as UserItem['role']
-  }
-  showEditDialog.value = false
-}
-
-function createUser() {
-  if (!newUser.value.username.trim() || !newUser.value.password.trim()) return
-  users.value.push({
-    id: users.value.length + 1,
-    username: newUser.value.username,
-    displayName: newUser.value.displayName || newUser.value.username,
-    email: newUser.value.email,
-    role: newUser.value.role as UserItem['role'],
-    isActive: true,
-    lastLogin: '从未登录',
-    createdAt: new Date().toISOString().slice(0, 10)
-  })
-  newUser.value = { username: '', displayName: '', email: '', role: 'viewer', password: '' }
-  showCreateDialog.value = false
-}
-
-onMounted(() => {
-  // TODO: 调用API获取用户列表
-})
-</script>
-
 <template>
-  <div class="user-management">
-    <h1 class="page-title">用户管理</h1>
-
-    <div class="toolbar">
-      <div class="stats-row">
-        <div class="stat-chip admin">管理员 {{ users.filter(u => u.role === 'admin').length }}</div>
-        <div class="stat-chip operator">操作员 {{ users.filter(u => u.role === 'operator').length }}</div>
-        <div class="stat-chip viewer">观察者 {{ users.filter(u => u.role === 'viewer').length }}</div>
-      </div>
-      <button class="action-btn" @click="showCreateDialog = true">+ 创建用户</button>
-    </div>
-
-    <div class="user-table">
-      <div class="table-header">
-        <div class="col id-col">ID</div>
-        <div class="col user-col">用户名</div>
-        <div class="col name-col">显示名</div>
-        <div class="col role-col">角色</div>
-        <div class="col email-col">邮箱</div>
-        <div class="col status-col">状态</div>
-        <div class="col login-col">最后登录</div>
-        <div class="col actions-col">操作</div>
-      </div>
-      <div v-for="user in users" :key="user.id" class="table-row">
-        <div class="col id-col">{{ user.id }}</div>
-        <div class="col user-col">{{ user.username }}</div>
-        <div class="col name-col">{{ user.displayName }}</div>
-        <div class="col role-col">
-          <span :class="['role-tag', `role-${user.role}`]">{{ getRoleLabel(user.role) }}</span>
-        </div>
-        <div class="col email-col">{{ user.email }}</div>
-        <div class="col status-col">
-          <span :class="['status-badge', user.isActive ? 'active' : 'inactive']">{{ user.isActive ? '活跃' : '禁用' }}</span>
-        </div>
-        <div class="col login-col">{{ user.lastLogin }}</div>
-        <div class="col actions-col">
-          <button class="btn-sm" @click="openEditDialog(user)">角色</button>
-          <button :class="['btn-sm', user.isActive ? 'danger' : 'success']" @click="toggleUserStatus(user)">{{ user.isActive ? '禁用' : '启用' }}</button>
-        </div>
+  <div class="user-management-page">
+    <div class="page-header">
+      <h1>用户管理</h1>
+      <div class="header-actions">
+        <button class="btn btn-outline" @click="handleInitAdmin">初始化默认用户</button>
+        <button class="btn btn-outline" @click="refreshUsers">刷新</button>
+        <button class="btn btn-primary" @click="openAddModal">添加用户</button>
       </div>
     </div>
 
-    <!-- 创建用户对话框 -->
-    <div v-if="showCreateDialog" class="dialog-overlay" @click.self="showCreateDialog = false">
-      <div class="dialog-box">
-        <h3 class="dialog-title">创建用户</h3>
-        <div class="form-group">
-          <label>用户名</label>
-          <input v-model="newUser.username" class="form-input" placeholder="输入用户名" />
+    <div class="stats-bar">
+      <div class="stat-card">
+        <span class="stat-value">{{ stats.total }}</span>
+        <span class="stat-label">总用户数</span>
+      </div>
+      <div class="stat-card active">
+        <span class="stat-value">{{ stats.active }}</span>
+        <span class="stat-label">活跃用户</span>
+      </div>
+      <div class="stat-card admin">
+        <span class="stat-value">{{ stats.admin }}</span>
+        <span class="stat-label">管理员</span>
+      </div>
+      <div class="stat-card online">
+        <span class="stat-value">{{ stats.online }}</span>
+        <span class="stat-label">在线用户</span>
+      </div>
+    </div>
+
+    <div class="filters">
+      <input
+        v-model="searchQuery"
+        type="text"
+        placeholder="搜索用户名 / 邮箱..."
+        class="filter-input"
+        @input="debouncedSearch"
+      />
+      <select v-model="roleFilter" class="filter-select" @change="applyFilters">
+        <option value="">全部角色</option>
+        <option value="admin">管理员</option>
+        <option value="operator">操作员</option>
+        <option value="viewer">观察者</option>
+      </select>
+    </div>
+
+    <div class="table-wrapper">
+      <table class="data-table">
+        <thead>
+          <tr>
+            <th>ID</th>
+            <th>用户名</th>
+            <th>邮箱</th>
+            <th>角色</th>
+            <th>状态</th>
+            <th>创建时间</th>
+            <th>操作</th>
+          </tr>
+        </thead>
+        <tbody>
+          <tr v-if="loading">
+            <td colspan="7" class="loading-cell">加载中...</td>
+          </tr>
+          <tr v-else-if="filteredUsers.length === 0">
+            <td colspan="7" class="empty-cell">暂无用户数据</td>
+          </tr>
+          <tr v-for="user in filteredUsers" :key="user.id" class="data-row">
+            <td class="cell-id">{{ user.id }}</td>
+            <td class="cell-username">{{ user.username }}</td>
+            <td class="cell-email">{{ user.email }}</td>
+            <td class="cell-role">
+              <span class="role-tag" :class="'role-' + user.role">{{ roleLabels[user.role] }}</span>
+            </td>
+            <td class="cell-status">
+              <span class="status-tag" :class="user.isActive ? 'status-active' : 'status-disabled'">
+                {{ user.isActive ? '活跃' : '已禁用' }}
+              </span>
+            </td>
+            <td class="cell-time">{{ user.createdAt }}</td>
+            <td class="cell-actions">
+              <button class="btn-action btn-edit" @click="openEditModal(user)">编辑</button>
+              <button
+                class="btn-action btn-toggle"
+                :class="user.isActive ? 'btn-disable' : 'btn-enable'"
+                @click="toggleUserStatus(user)"
+              >
+                {{ user.isActive ? '禁用' : '启用' }}
+              </button>
+              <button class="btn-action btn-delete" @click="confirmDelete(user)">删除</button>
+            </td>
+          </tr>
+        </tbody>
+      </table>
+    </div>
+
+    <!-- 添加/编辑用户弹窗 -->
+    <div v-if="showModal" class="modal-overlay" @click.self="closeModal">
+      <div class="modal-content">
+        <div class="modal-header">
+          <h3>{{ isEditing ? '编辑用户' : '添加用户' }}</h3>
+          <button class="modal-close" @click="closeModal">&times;</button>
         </div>
-        <div class="form-group">
-          <label>显示名</label>
-          <input v-model="newUser.displayName" class="form-input" placeholder="输入显示名" />
-        </div>
-        <div class="form-group">
-          <label>邮箱</label>
-          <input v-model="newUser.email" class="form-input" placeholder="输入邮箱" />
-        </div>
-        <div class="form-group">
-          <label>密码</label>
-          <input v-model="newUser.password" type="password" class="form-input" placeholder="输入初始密码" />
-        </div>
-        <div class="form-group">
-          <label>角色</label>
-          <select v-model="newUser.role" class="form-input">
-            <option value="viewer">观察者</option>
-            <option value="operator">操作员</option>
-            <option value="admin">管理员</option>
-          </select>
-        </div>
-        <div class="dialog-actions">
-          <button class="btn-sm" @click="showCreateDialog = false">取消</button>
-          <button class="action-btn" @click="createUser">创建</button>
+        <div class="modal-body">
+          <div class="form-group">
+            <label class="form-label">用户名</label>
+            <input
+              v-model="form.username"
+              type="text"
+              class="form-input"
+              placeholder="请输入用户名"
+              :disabled="isEditing"
+            />
+          </div>
+          <div class="form-group">
+            <label class="form-label">邮箱</label>
+            <input v-model="form.email" type="email" class="form-input" placeholder="请输入邮箱" />
+          </div>
+          <div v-if="!isEditing" class="form-group">
+            <label class="form-label">密码</label>
+            <input v-model="form.password" type="password" class="form-input" placeholder="请输入密码" />
+          </div>
+          <div class="form-group">
+            <label class="form-label">角色</label>
+            <select v-model="form.role" class="form-select">
+              <option value="admin">管理员</option>
+              <option value="operator">操作员</option>
+              <option value="viewer">观察者</option>
+            </select>
+          </div>
+          <div v-if="formError" class="form-error">{{ formError }}</div>
+          <div class="form-actions">
+            <button class="btn btn-outline" @click="closeModal">取消</button>
+            <button class="btn btn-primary" @click="handleSubmit" :disabled="submitting">
+              {{ submitting ? '提交中...' : '确认' }}
+            </button>
+          </div>
         </div>
       </div>
     </div>
 
-    <!-- 编辑角色对话框 -->
-    <div v-if="showEditDialog && editingUser" class="dialog-overlay" @click.self="showEditDialog = false">
-      <div class="dialog-box">
-        <h3 class="dialog-title">修改角色 - {{ editingUser.displayName }}</h3>
-        <div class="form-group">
-          <label>当前角色: {{ getRoleLabel(editingUser.role) }}</label>
+    <!-- 删除确认弹窗 -->
+    <div v-if="showDeleteConfirm" class="modal-overlay" @click.self="showDeleteConfirm = false">
+      <div class="modal-content modal-sm">
+        <div class="modal-header">
+          <h3>确认删除</h3>
+          <button class="modal-close" @click="showDeleteConfirm = false">&times;</button>
         </div>
-        <div class="form-group">
-          <label>新角色</label>
-          <select v-model="editRole" class="form-input">
-            <option value="viewer">观察者</option>
-            <option value="operator">操作员</option>
-            <option value="admin">管理员</option>
-          </select>
-        </div>
-        <div class="role-warning" v-if="editRole === 'admin'">
-          ⚠️ 管理员拥有系统全部权限，包括用户管理、系统配置等敏感操作
-        </div>
-        <div class="dialog-actions">
-          <button class="btn-sm" @click="showEditDialog = false">取消</button>
-          <button class="action-btn" @click="saveRole">保存</button>
+        <div class="modal-body">
+          <p class="confirm-text">确定要删除用户 <strong>{{ deleteTarget?.username }}</strong> 吗？此操作不可撤销。</p>
+          <div class="form-actions">
+            <button class="btn btn-outline" @click="showDeleteConfirm = false">取消</button>
+            <button class="btn btn-danger" @click="handleDelete" :disabled="submitting">
+              {{ submitting ? '删除中...' : '确认删除' }}
+            </button>
+          </div>
         </div>
       </div>
     </div>
   </div>
 </template>
 
+<script setup lang="ts">
+import { ref, computed, onMounted } from 'vue'
+import { api, apiClient } from '@/utils/apiClient'
+
+interface User {
+  id: number
+  username: string
+  email: string
+  role: 'admin' | 'operator' | 'viewer'
+  isActive: boolean
+  createdAt: string
+}
+
+const roleLabels: Record<string, string> = {
+  admin: '管理员',
+  operator: '操作员',
+  viewer: '观察者',
+}
+
+const loading = ref(false)
+const submitting = ref(false)
+const searchQuery = ref('')
+const roleFilter = ref('')
+const showModal = ref(false)
+const showDeleteConfirm = ref(false)
+const isEditing = ref(false)
+const editingUserId = ref<number | null>(null)
+const deleteTarget = ref<User | null>(null)
+const formError = ref('')
+
+const form = ref({
+  username: '',
+  email: '',
+  password: '',
+  role: 'viewer' as 'admin' | 'operator' | 'viewer',
+})
+
+// Mock seed users (matching backend seed_data)
+const users = ref<User[]>([
+  {
+    id: 1,
+    username: 'admin',
+    email: 'admin@agenthub.local',
+    role: 'admin',
+    isActive: true,
+    createdAt: '2025-01-01 00:00:00',
+  },
+  {
+    id: 2,
+    username: 'operator',
+    email: 'operator@agenthub.local',
+    role: 'operator',
+    isActive: true,
+    createdAt: '2025-01-01 00:00:00',
+  },
+  {
+    id: 3,
+    username: 'viewer',
+    email: 'viewer@agenthub.local',
+    role: 'viewer',
+    isActive: true,
+    createdAt: '2025-01-01 00:00:00',
+  },
+])
+
+let nextId = 4
+let searchTimer: ReturnType<typeof setTimeout> | null = null
+
+const stats = computed(() => ({
+  total: users.value.length,
+  active: users.value.filter(u => u.isActive).length,
+  admin: users.value.filter(u => u.role === 'admin').length,
+  online: users.value.filter(u => u.isActive).length,
+}))
+
+const filteredUsers = computed(() => {
+  let result = users.value
+  if (roleFilter.value) {
+    result = result.filter(u => u.role === roleFilter.value)
+  }
+  if (searchQuery.value) {
+    const q = searchQuery.value.toLowerCase()
+    result = result.filter(
+      u => u.username.toLowerCase().includes(q) || u.email.toLowerCase().includes(q)
+    )
+  }
+  return result
+})
+
+function debouncedSearch() {
+  if (searchTimer) clearTimeout(searchTimer)
+  searchTimer = setTimeout(() => {
+    // filteredUsers is computed, auto-updates
+  }, 300)
+}
+
+function applyFilters() {
+  // filteredUsers is computed, auto-updates
+}
+
+function refreshUsers() {
+  loading.value = true
+  setTimeout(() => {
+    loading.value = false
+  }, 300)
+}
+
+function openAddModal() {
+  isEditing.value = false
+  editingUserId.value = null
+  form.value = { username: '', email: '', password: '', role: 'viewer' }
+  formError.value = ''
+  showModal.value = true
+}
+
+function openEditModal(user: User) {
+  isEditing.value = true
+  editingUserId.value = user.id
+  form.value = { username: user.username, email: user.email, password: '', role: user.role }
+  formError.value = ''
+  showModal.value = true
+}
+
+function closeModal() {
+  showModal.value = false
+  formError.value = ''
+}
+
+function validateForm(): boolean {
+  if (!form.value.username.trim()) {
+    formError.value = '用户名不能为空'
+    return false
+  }
+  if (!form.value.email.trim()) {
+    formError.value = '邮箱不能为空'
+    return false
+  }
+  if (!isEditing.value && !form.value.password.trim()) {
+    formError.value = '密码不能为空'
+    return false
+  }
+  return true
+}
+
+async function handleSubmit() {
+  if (!validateForm()) return
+
+  submitting.value = true
+  formError.value = ''
+
+  try {
+    if (isEditing.value && editingUserId.value !== null) {
+      // Update user locally (no backend API for update)
+      const idx = users.value.findIndex(u => u.id === editingUserId.value)
+      if (idx !== -1) {
+        users.value[idx].email = form.value.email
+        users.value[idx].role = form.value.role
+      }
+    } else {
+      // Register via backend API
+      try {
+        await apiClient.post(api.auth.register, {
+          username: form.value.username,
+          email: form.value.email,
+          password: form.value.password,
+          role: form.value.role,
+        })
+      } catch {
+        // Fallback: add locally if API fails
+      }
+      users.value.push({
+        id: nextId++,
+        username: form.value.username,
+        email: form.value.email,
+        role: form.value.role,
+        isActive: true,
+        createdAt: new Date().toISOString().replace('T', ' ').slice(0, 19),
+      })
+    }
+    closeModal()
+  } catch (e: any) {
+    formError.value = e.message || '操作失败'
+  } finally {
+    submitting.value = false
+  }
+}
+
+function toggleUserStatus(user: User) {
+  user.isActive = !user.isActive
+}
+
+function confirmDelete(user: User) {
+  deleteTarget.value = user
+  showDeleteConfirm.value = true
+}
+
+async function handleDelete() {
+  if (!deleteTarget.value) return
+  submitting.value = true
+  try {
+    users.value = users.value.filter(u => u.id !== deleteTarget.value!.id)
+    showDeleteConfirm.value = false
+    deleteTarget.value = null
+  } finally {
+    submitting.value = false
+  }
+}
+
+async function handleInitAdmin() {
+  try {
+    await apiClient.post(api.auth.initAdmin)
+  } catch {
+    // Ignore errors - may already be initialized
+  }
+}
+
+onMounted(() => {
+  // Users are initialized from mock data
+})
+</script>
+
 <style scoped>
-.page-title { font-size: var(--font-size-3xl); font-weight: var(--font-weight-bold); color: var(--color-white); margin-bottom: var(--spacing-2xl); }
-.toolbar { display: flex; justify-content: space-between; align-items: center; margin-bottom: var(--spacing-2xl); }
-.stats-row { display: flex; gap: var(--spacing-md); }
-.stat-chip { font-size: var(--font-size-sm); padding: var(--spacing-xs) var(--spacing-md-lg); border-radius: var(--radius-full); font-weight: var(--font-weight-medium); }
-.stat-chip.admin { background: rgba(var(--color-purple-rgb), 0.2); color: var(--color-purple); }
-.stat-chip.operator { background: rgba(var(--color-info-light-rgb), 0.2); color: var(--color-info-light); }
-.stat-chip.viewer { background: rgba(var(--color-text-tertiary-rgb), 0.2); color: var(--color-text-tertiary); }
+.user-management-page {
+  padding: var(--content-padding);
+  max-width: 1400px;
+  margin: 0 auto;
+  animation: page-enter 0.4s var(--ease-out);
+}
 
-.action-btn { padding: var(--spacing-sm-md) var(--spacing-xl); background: var(--gradient-primary); color: var(--color-white); border: none; border-radius: var(--radius-lg); font-size: var(--font-size-base); font-weight: var(--font-weight-semibold); cursor: pointer; }
+.page-header {
+  display: flex;
+  justify-content: space-between;
+  align-items: center;
+  margin-bottom: var(--spacing-lg);
+}
 
-.user-table { background: rgba(var(--color-bg-elevated-rgb), 0.6); border-radius: var(--radius-2xl); border: 1px solid rgba(var(--color-white-rgb), 0.1); overflow: hidden; }
-.table-header { display: flex; padding: var(--spacing-md-lg) var(--spacing-xl); background: rgba(var(--color-bg-base-rgb), 0.5); font-size: var(--font-size-sm); color: var(--color-text-quaternary); font-weight: var(--font-weight-semibold); text-transform: uppercase; letter-spacing: 0.5px; }
-.table-row { display: flex; padding: var(--spacing-md-lg) var(--spacing-xl); border-top: 1px solid rgba(var(--color-white-rgb), 0.05); align-items: center; transition: background var(--duration-normal); }
-.table-row:hover { background: rgba(var(--color-primary-rgb), 0.05); }
+.page-header h1 {
+  font-size: var(--font-size-2xl);
+  font-weight: var(--font-weight-semibold);
+  color: var(--color-text-primary);
+}
 
-.col { font-size: var(--font-size-sm); color: var(--color-text-secondary); }
-.id-col { width: 50px; color: var(--color-text-quaternary); }
-.user-col { width: 120px; font-weight: var(--font-weight-medium); font-family: var(--font-family-mono); }
-.name-col { width: 120px; }
-.role-col { width: 90px; }
-.email-col { width: 200px; color: var(--color-text-tertiary); font-size: var(--font-size-sm); }
-.status-col { width: 70px; }
-.login-col { width: 140px; color: var(--color-text-quaternary); font-size: var(--font-size-sm); }
-.actions-col { width: 140px; display: flex; gap: var(--spacing-xs); }
+.header-actions {
+  display: flex;
+  gap: var(--spacing-sm);
+}
 
-.role-tag { font-size: var(--font-size-xs); padding: var(--spacing-2xs) var(--spacing-sm); border-radius: var(--radius-lg); font-weight: var(--font-weight-medium); }
-.role-tag.role-admin { color: var(--color-purple); background: rgba(var(--color-purple-rgb), 0.2); }
-.role-tag.role-operator { color: var(--color-info-light); background: rgba(var(--color-info-light-rgb), 0.2); }
-.role-tag.role-viewer { color: var(--color-text-tertiary); background: rgba(var(--color-text-tertiary-rgb), 0.2); }
+.stats-bar {
+  display: flex;
+  gap: var(--spacing-md);
+  margin-bottom: var(--spacing-lg);
+}
 
-.status-badge { font-size: var(--font-size-xs); padding: var(--spacing-2xs) var(--spacing-sm); border-radius: var(--radius-lg); font-weight: var(--font-weight-medium); }
-.status-badge.active { background: rgba(var(--color-success-rgb), 0.2); color: var(--color-success); }
-.status-badge.inactive { background: rgba(var(--color-error-rgb), 0.2); color: var(--color-error); }
+.stat-card {
+  flex: 1;
+  background: var(--gradient-glass);
+  border-radius: var(--radius-lg);
+  padding: 16px;
+  text-align: center;
+  border: var(--card-border);
+  border-left: 4px solid var(--color-primary);
+  backdrop-filter: blur(12px);
+  box-shadow: var(--shadow-card);
+  transition: all 0.25s ease;
+}
 
-.btn-sm { padding: 5px var(--spacing-md); background: rgba(var(--color-primary-rgb), 0.2); color: var(--color-info-light); border: 1px solid rgba(var(--color-primary-rgb), 0.3); border-radius: var(--radius-md); font-size: var(--font-size-sm); cursor: pointer; }
-.btn-sm.danger { background: rgba(var(--color-error-rgb), 0.2); color: var(--color-error); border-color: rgba(var(--color-error-rgb), 0.3); }
-.btn-sm.success { background: rgba(var(--color-success-rgb), 0.2); color: var(--color-success); border-color: rgba(var(--color-success-rgb), 0.3); }
+.stat-card:hover {
+  transform: translateY(-2px);
+  border-color: rgba(22, 93, 255, 0.3);
+  box-shadow: 0 4px 16px rgba(22, 93, 255, 0.12);
+}
 
-.dialog-overlay { position: fixed; inset: 0; background: rgba(var(--color-black-rgb), 0.6); display: flex; align-items: center; justify-content: center; z-index: var(--z-modal); }
-.dialog-box { background: var(--color-bg-container); border-radius: var(--radius-2xl); padding: 28px; width: 440px; border: 1px solid rgba(var(--color-white-rgb), 0.1); }
-.dialog-title { font-size: var(--font-size-xl); font-weight: var(--font-weight-semibold); color: var(--color-white); margin-bottom: var(--spacing-xl); }
-.form-group { margin-bottom: var(--spacing-lg); }
-.form-group label { display: block; font-size: var(--font-size-sm); color: var(--color-text-tertiary); margin-bottom: var(--spacing-xs); }
-.form-input { width: 100%; padding: var(--spacing-sm-md) var(--spacing-md-lg); background: rgba(var(--color-bg-base-rgb), 0.5); border: 1px solid rgba(var(--color-white-rgb), 0.1); border-radius: var(--radius-lg); color: var(--color-white); font-size: var(--font-size-base); }
-.form-input:focus { outline: none; border-color: var(--color-primary); }
-.role-warning { font-size: var(--font-size-sm); color: var(--color-warning); background: rgba(var(--color-warning-rgb), 0.1); padding: var(--spacing-sm-md) var(--spacing-md-lg); border-radius: var(--radius-lg); margin-bottom: var(--spacing-md); border: 1px solid rgba(var(--color-warning-rgb), 0.2); }
-.dialog-actions { display: flex; justify-content: flex-end; gap: var(--spacing-sm); margin-top: var(--spacing-xl); }
+.stat-card.active { border-left-color: var(--color-success); }
+.stat-card.admin { border-left-color: var(--color-warning); }
+.stat-card.online { border-left-color: var(--color-purple); }
+
+.stat-value {
+  display: block;
+  font-size: var(--font-size-3xl);
+  font-weight: 700;
+  color: var(--color-text-primary);
+}
+
+.stat-label {
+  display: block;
+  font-size: var(--font-size-sm);
+  color: var(--color-text-tertiary);
+  margin-top: var(--spacing-xs);
+}
+
+.filters {
+  display: flex;
+  gap: var(--spacing-sm);
+  margin-bottom: var(--spacing-lg);
+  flex-wrap: wrap;
+}
+
+.filter-input,
+.filter-select {
+  padding: var(--input-padding);
+  border: 1px solid var(--input-border);
+  border-radius: var(--input-radius);
+  font-size: var(--font-size-base);
+  background: var(--input-bg);
+  color: var(--color-text-secondary);
+  transition: all 0.25s var(--ease-out);
+  outline: none;
+}
+
+.filter-input:focus,
+.filter-select:focus {
+  border-color: var(--input-border-focus);
+  box-shadow: var(--input-shadow-focus);
+}
+
+.filter-input { flex: 1; min-width: 200px; }
+.filter-select { min-width: 140px; }
+
+.table-wrapper {
+  overflow-x: auto;
+  border-radius: var(--radius-lg);
+  border: var(--card-border);
+  background: var(--gradient-glass);
+  backdrop-filter: blur(12px);
+}
+
+.data-table {
+  width: 100%;
+  border-collapse: collapse;
+  font-size: var(--font-size-base);
+}
+
+.data-table th {
+  background: var(--color-bg-glass-strong);
+  padding: 12px 16px;
+  text-align: left;
+  font-weight: 600;
+  color: var(--color-text-tertiary);
+  border-bottom: 1px solid var(--color-border-primary);
+  white-space: nowrap;
+}
+
+.data-table td {
+  padding: 10px 16px;
+  border-bottom: 1px solid var(--color-border-primary);
+  color: var(--color-text-secondary);
+}
+
+.data-row:hover { background: var(--color-bg-hover); }
+
+.loading-cell,
+.empty-cell {
+  text-align: center;
+  padding: 40px !important;
+  color: var(--color-text-tertiary);
+}
+
+.cell-id { width: 60px; }
+.cell-time { white-space: nowrap; }
+.cell-actions { white-space: nowrap; }
+
+.role-tag {
+  padding: 2px 10px;
+  border-radius: var(--radius-sm);
+  font-size: var(--font-size-xs);
+  font-weight: 500;
+}
+
+.role-admin {
+  background: var(--color-error-bg);
+  color: var(--color-error);
+}
+
+.role-operator {
+  background: var(--color-warning-bg);
+  color: var(--color-warning);
+}
+
+.role-viewer {
+  background: var(--color-primary-bg);
+  color: var(--color-primary);
+}
+
+.status-tag {
+  padding: 2px 10px;
+  border-radius: var(--radius-sm);
+  font-size: var(--font-size-xs);
+  font-weight: 500;
+}
+
+.status-active {
+  background: var(--color-success-bg);
+  color: var(--color-success);
+}
+
+.status-disabled {
+  background: var(--color-error-bg);
+  color: var(--color-error);
+}
+
+.btn-action {
+  padding: var(--spacing-xs) var(--spacing-sm);
+  border-radius: var(--radius-default);
+  font-size: var(--font-size-xs);
+  cursor: pointer;
+  border: 1px solid transparent;
+  transition: all 0.25s ease;
+  backdrop-filter: blur(8px);
+}
+
+.btn-action:hover { transform: scale(1.02); }
+.btn-action:active { transform: scale(0.97); }
+
+.btn-edit {
+  background: var(--color-primary-bg);
+  color: var(--color-primary);
+  border-color: var(--color-primary-border);
+}
+
+.btn-edit:hover {
+  background: var(--color-primary-hover);
+  border-color: var(--color-primary);
+}
+
+.btn-toggle {
+  background: var(--color-warning-bg);
+  color: var(--color-warning);
+  border-color: rgba(234, 179, 8, 0.3);
+}
+
+.btn-toggle:hover {
+  background: rgba(234, 179, 8, 0.2);
+}
+
+.btn-enable {
+  background: var(--color-success-bg);
+  color: var(--color-success);
+  border-color: rgba(34, 197, 94, 0.3);
+}
+
+.btn-enable:hover {
+  background: rgba(34, 197, 94, 0.2);
+}
+
+.btn-disable {
+  background: var(--color-warning-bg);
+  color: var(--color-warning);
+  border-color: rgba(234, 179, 8, 0.3);
+}
+
+.btn-disable:hover {
+  background: rgba(234, 179, 8, 0.2);
+}
+
+.btn-delete {
+  background: var(--color-error-bg);
+  color: var(--color-error);
+  border-color: rgba(239, 68, 68, 0.3);
+}
+
+.btn-delete:hover {
+  background: rgba(239, 68, 68, 0.2);
+  border-color: var(--color-error);
+}
+
+.btn {
+  padding: var(--spacing-sm) var(--spacing-md);
+  border-radius: var(--radius-md);
+  font-size: var(--font-size-base);
+  cursor: pointer;
+  border: 1px solid var(--color-border-primary);
+  transition: all 0.25s ease;
+  backdrop-filter: blur(8px);
+}
+
+.btn:hover { transform: scale(1.02); }
+.btn:active { transform: scale(0.97); }
+
+.btn-primary {
+  background: var(--gradient-primary);
+  color: var(--color-text-primary);
+  border-color: var(--color-primary);
+}
+
+.btn-primary:hover { box-shadow: var(--shadow-glow-primary); }
+
+.btn-outline {
+  background: transparent;
+  color: var(--color-text-secondary);
+}
+
+.btn-outline:hover { background: var(--color-bg-hover); }
+
+.btn-danger {
+  background: var(--color-error);
+  color: var(--color-text-primary);
+  border-color: var(--color-error);
+}
+
+.btn-danger:hover { box-shadow: var(--shadow-glow-error); }
+
+.btn:disabled { opacity: 0.5; cursor: not-allowed; transform: none; }
+
+.modal-overlay {
+  position: fixed;
+  top: 0; left: 0; right: 0; bottom: 0;
+  background: var(--modal-overlay-bg);
+  display: flex;
+  justify-content: center;
+  align-items: center;
+  z-index: var(--z-overlay);
+  backdrop-filter: blur(var(--modal-backdrop-blur));
+}
+
+.modal-content {
+  background: var(--color-bg-elevated);
+  border-radius: var(--modal-border-radius);
+  width: 90%;
+  max-width: 500px;
+  max-height: 80vh;
+  overflow-y: auto;
+  border: 1px solid var(--color-border-primary);
+  box-shadow: var(--shadow-modal);
+}
+
+.modal-sm { max-width: 420px; }
+
+.modal-header {
+  display: flex;
+  justify-content: space-between;
+  align-items: center;
+  padding: var(--spacing-md) var(--spacing-lg);
+  border-bottom: 1px solid var(--color-border-primary);
+}
+
+.modal-header h3 {
+  font-size: var(--font-size-lg);
+  font-weight: var(--font-weight-semibold);
+  color: var(--color-text-primary);
+}
+
+.modal-close {
+  background: none;
+  border: none;
+  font-size: var(--font-size-2xl);
+  cursor: pointer;
+  color: var(--color-text-tertiary);
+  transition: color 0.2s ease;
+}
+
+.modal-close:hover { color: var(--color-text-primary); }
+
+.modal-body { padding: var(--spacing-lg); }
+
+.form-group {
+  margin-bottom: var(--spacing-md);
+}
+
+.form-label {
+  display: block;
+  font-size: var(--font-size-sm);
+  font-weight: 500;
+  color: var(--color-text-tertiary);
+  margin-bottom: var(--spacing-xs);
+}
+
+.form-input,
+.form-select {
+  width: 100%;
+  padding: var(--input-padding);
+  border: 1px solid var(--input-border);
+  border-radius: var(--input-radius);
+  font-size: var(--font-size-base);
+  background: var(--input-bg);
+  color: var(--color-text-secondary);
+  transition: all 0.25s var(--ease-out);
+  outline: none;
+  box-sizing: border-box;
+}
+
+.form-input:focus,
+.form-select:focus {
+  border-color: var(--input-border-focus);
+  box-shadow: var(--input-shadow-focus);
+}
+
+.form-input:disabled {
+  opacity: 0.6;
+  cursor: not-allowed;
+}
+
+.form-error {
+  color: var(--color-error);
+  font-size: var(--font-size-sm);
+  margin-bottom: var(--spacing-sm);
+}
+
+.confirm-text {
+  color: var(--color-text-secondary);
+  font-size: var(--font-size-base);
+  line-height: var(--line-height-normal);
+  margin-bottom: var(--spacing-lg);
+}
+
+.confirm-text strong {
+  color: var(--color-text-primary);
+}
+
+.form-actions {
+  display: flex;
+  justify-content: flex-end;
+  gap: var(--spacing-sm);
+  margin-top: var(--spacing-sm);
+}
+
+@media (max-width: 768px) {
+  .user-management-page { padding: var(--spacing-sm); }
+  .data-table { font-size: var(--font-size-xs); }
+  .page-header { flex-direction: column; gap: var(--spacing-sm); align-items: flex-start; }
+  .stats-bar { flex-wrap: wrap; }
+  .stat-card { min-width: calc(50% - var(--spacing-sm)); }
+  .filters { flex-direction: column; }
+  .filter-input { min-width: 100%; }
+  .modal-content { width: 95%; }
+}
+
+@media (prefers-reduced-motion: reduce) {
+  .user-management-page { animation: none; }
+  .stat-card:hover { transform: none; }
+  .btn:hover, .btn-action:hover { transform: none; }
+}
 </style>

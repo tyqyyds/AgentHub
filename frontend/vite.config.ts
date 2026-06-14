@@ -9,13 +9,26 @@ export default defineConfig({
       '@': resolve(__dirname, 'src')
     }
   },
+  css: {
+    preprocessorOptions: {
+      scss: {
+        additionalData: `@use "@/styles/variables" as *;`
+      }
+    }
+  },
   server: {
-    port: 5173,
+    host: '0.0.0.0',
+    port: 5175,
     proxy: {
       '/api': {
-        target: 'http://localhost:8001',
+        target: 'http://127.0.0.1:8001',
         changeOrigin: true,
         ws: true
+      },
+      '/ws': {
+        target: 'ws://127.0.0.1:8001',
+        ws: true,
+        changeOrigin: true
       }
     }
   },
@@ -23,11 +36,15 @@ export default defineConfig({
     rollupOptions: {
       output: {
         manualChunks: {
-          'element-plus': ['element-plus'],
-          'vendor': ['vue', 'vue-router', 'pinia', 'axios', '@vue/shared', '@vueuse/core']
+          'vue-vendor': ['vue', 'vue-router', 'pinia'],
+          'ui-vendor': ['element-plus'],
+          'charts': ['echarts'],
+          'map-vendor': ['leaflet', '@amap/amap-jsapi-loader'],
         }
       }
     },
-    chunkSizeWarningLimit: 1000
+    chunkSizeWarningLimit: 500,
+    sourcemap: false,
+    minify: 'esbuild'
   }
 })

@@ -1,0 +1,27 @@
+{
+  "test-v2-agent": {
+    "agent_id": "test-v2-agent",
+    "agent_type": "qos_agent",
+    "name": "QoS\u914d\u7f6eAgent",
+    "description": "\u8d1f\u8d23QoS\u7b56\u7565\u914d\u7f6e",
+    "capabilities": [
+      "qos_config",
+      "bandwidth_monitor"
+    ],
+    "status": "online",
+    "last_heartbeat": null,
+    "endpoint": "http://localhost:8081"
+  },
+  "auth-test": {
+    "agent_id": "auth-test",
+    "agent_type": "test",
+    "name": "AuthTest",
+    "description": "Auth test",
+    "capabilities": [
+      "test"
+    ],
+    "status": "online",
+    "last_heartbeat": null,
+    "endpoint": null
+  }
+}

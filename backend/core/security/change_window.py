@@ -1,5 +1,5 @@
-from datetime import datetime, time, timedelta, timezone
-from ..config import settings
+from datetime import datetime, time, timedelta
+from backend.core.config import settings
 
 class ChangeWindowManager:
     def __init__(self):
@@ -13,7 +13,7 @@ class ChangeWindowManager:
             return time(8, 0)
     
     def is_within_window(self) -> bool:
-        now = datetime.now(timezone.utc).time()
+        now = datetime.now().time()
         
         if self.start_time <= self.end_time:
             return self.start_time <= now <= self.end_time
@@ -21,7 +21,7 @@ class ChangeWindowManager:
             return now >= self.start_time or now <= self.end_time
     
     def get_time_until_window(self) -> int:
-        now = datetime.now(timezone.utc).time()
+        now = datetime.now().time()
         
         if self.is_within_window():
             return 0

@@ -1,127 +1,170 @@
 from fastapi import APIRouter, Depends, HTTPException, Query
-from sqlalchemy.ext.asyncio import AsyncSession
-from sqlalchemy import select
 from pydantic import BaseModel
 from typing import Optional
-from ..database.connection import get_db_session
-from ..database.models import FailedIntentCase, FailureStage, Intent
-from .deps import get_current_user
+from backend.core.security.rbac import get_current_user, requires_permission
+from backend.agents.failed_intent_store import get_failed_intent_store
+from backend.api.response import success_response
+import logging
+
+logger = logging.getLogger(__name__)
 
 router = APIRouter()
 
 
-class FailedIntentCreate(BaseModel):
-    intent_id: int
-    failure_reason: Optional[str] = None
-    failure_stage: str
-    root_cause: Optional[str] = None
-    resolution_notes: Optional[str] = None
+class ResolveCaseRequest(BaseModel):
+    user_clarification: str
+    resolution_notes: str
 
 
-class FailedIntentUpdate(BaseModel):
-    failure_reason: Optional[str] = None
-    root_cause: Optional[str] = None
-    resolution_notes: Optional[str] = None
-
-
-@router.get("/")
+@router.get("")
 async def list_failed_intents(
-    failure_stage: Optional[str] = Query(None),
-    skip: int = Query(0, ge=0),
-    limit: int = Query(20, ge=1, le=100),
-    db: AsyncSession = Depends(get_db_session),
+    resolved: Optional[bool] = None,
+    parse_method: Optional[str] = None,
+    limit: int = Query(default=50, ge=1, le=200),
+    offset: int = Query(default=0, ge=0),
     current_user=Depends(get_current_user),
+    _: None = Depends(requires_permission("intents:read")),
 ):
-    query = select(FailedIntentCase)
-    if failure_stage:
-        query = query.where(FailedIntentCase.failure_stage == failure_stage)
-    query = query.offset(skip).limit(limit)
-    result = await db.execute(query)
-    cases = result.scalars().all()
-    return {"status": "success", "data": [{"id": c.id, "intent_id": c.intent_id, "failure_reason": c.failure_reason, "failure_stage": c.failure_stage.value if c.failure_stage else None, "root_cause": c.root_cause, "resolution_notes": c.resolution_notes, "created_at": c.created_at.isoformat() if c.created_at else None} for c in cases]}
+    try:
+        store = get_failed_intent_store()
+        cases = await store.list_cases(resolved=resolved, limit=limit, offset=offset)
+
+        data = []
+        for case in cases:
+            if parse_method and case.parse_method != parse_method:
+                continue
+            # 根据failure_reason推断分类
+            reason = case.failure_reason or ""
+            if "模糊" in reason or "歧义" in reason or "宽泛" in reason:
+                category = "ambiguous_input"
+            elif "缺少" in reason or "参数" in reason:
+                category = "entity_missing"
+            elif "安全" in reason or "拦截" in reason:
+                category = "unsupported_intent"
+            elif "格式" in reason or "异常" in reason:
+                category = "parse_error"
+            elif "超时" in reason or "timeout" in reason.lower():
+                category = "timeout"
+            elif "不匹配" in reason or "超出" in reason:
+                category = "unsupported_intent"
+            else:
+                category = "parse_error"
+            data.append({
+                "id": case.id,
+                "user_input": case.user_input,
+                "parse_method": case.parse_method,
+                "failure_reason": case.failure_reason,
+                "failure_reason_category": category,
+                "raw_response": case.raw_response,
+                "intent_type_attempted": case.intent_type_attempted,
+                "clarification_question": case.clarification_question,
+                "user_clarification": case.user_clarification,
+                "resolved": case.resolved,
+                "resolution_notes": case.resolution_notes,
+                "metadata": case.meta_data,
+                "created_at": case.created_at.isoformat() if case.created_at else None,
+                "updated_at": case.updated_at.isoformat() if case.updated_at else None,
+            })
+
+        # 获取总数用于分页
+        stats = await store.get_failure_stats()
+        total_count = stats.get("total", len(data))
+
+        return success_response(data={"items": data, "total": total_count, "count": len(data)})
+    except Exception as e:
+        logger.error(f"List failed intents failed: {e}", exc_info=True)
+        raise HTTPException(status_code=500, detail="Internal server error")
+
+
+@router.get("/stats")
+async def get_failure_stats(current_user=Depends(get_current_user), _: None = Depends(requires_permission("intents:read"))):
+    try:
+        store = get_failed_intent_store()
+        stats = await store.get_failure_stats()
+        return success_response(data=stats)
+    except Exception as e:
+        logger.error(f"Get failure stats failed: {e}", exc_info=True)
+        raise HTTPException(status_code=500, detail="Internal server error")
+
+
+@router.get("/finetuning-data")
+async def get_finetuning_data(
+    limit: int = Query(default=100, ge=1, le=500),
+    current_user=Depends(get_current_user),
+    _: None = Depends(requires_permission("intents:read")),
+):
+    try:
+        store = get_failed_intent_store()
+        data = await store.get_cases_for_finetuning(limit=limit)
+        return success_response(data={"items": data, "count": len(data)})
+    except Exception as e:
+        logger.error(f"Get finetuning data failed: {e}", exc_info=True)
+        raise HTTPException(status_code=500, detail="Internal server error")
 
 
 @router.get("/{case_id}")
-async def get_failed_intent(
+async def get_failed_intent(case_id: int, current_user=Depends(get_current_user), _: None = Depends(requires_permission("intents:read"))):
+    try:
+        store = get_failed_intent_store()
+        case = await store.get_case(case_id)
+        if not case:
+            raise HTTPException(status_code=404, detail="Failed intent case not found")
+        return success_response(data={
+                "id": case.id,
+                "user_input": case.user_input,
+                "parse_method": case.parse_method,
+                "failure_reason": case.failure_reason,
+                "raw_response": case.raw_response,
+                "intent_type_attempted": case.intent_type_attempted,
+                "clarification_question": case.clarification_question,
+                "user_clarification": case.user_clarification,
+                "resolved": case.resolved,
+                "resolution_notes": case.resolution_notes,
+                "metadata": case.meta_data,
+                "created_at": case.created_at.isoformat() if case.created_at else None,
+                "updated_at": case.updated_at.isoformat() if case.updated_at else None,
+            })
+    except HTTPException:
+        raise
+    except Exception as e:
+        logger.error(f"Get failed intent failed: {e}", exc_info=True)
+        raise HTTPException(status_code=500, detail="Internal server error")
+
+
+@router.post("/{case_id}/resolve")
+async def resolve_failed_intent(
     case_id: int,
-    db: AsyncSession = Depends(get_db_session),
+    req: ResolveCaseRequest,
     current_user=Depends(get_current_user),
+    _: None = Depends(requires_permission("intents:approve"))
 ):
-    result = await db.execute(select(FailedIntentCase).where(FailedIntentCase.id == case_id))
-    case = result.scalar_one_or_none()
-    if not case:
-        raise HTTPException(status_code=404, detail="Failed intent case not found")
-    return {"status": "success", "data": {"id": case.id, "intent_id": case.intent_id, "failure_reason": case.failure_reason, "failure_stage": case.failure_stage.value if case.failure_stage else None, "root_cause": case.root_cause, "resolution_notes": case.resolution_notes, "created_at": case.created_at.isoformat() if case.created_at else None}}
-
-
-@router.post("/")
-async def create_failed_intent(
-    req: FailedIntentCreate,
-    db: AsyncSession = Depends(get_db_session),
-    current_user=Depends(get_current_user),
-):
-    intent_result = await db.execute(select(Intent).where(Intent.id == req.intent_id))
-    if not intent_result.scalar_one_or_none():
-        raise HTTPException(status_code=404, detail="Intent not found")
-    case = FailedIntentCase(
-        intent_id=req.intent_id,
-        failure_reason=req.failure_reason,
-        failure_stage=FailureStage(req.failure_stage),
-        root_cause=req.root_cause,
-        resolution_notes=req.resolution_notes,
-    )
-    db.add(case)
-    await db.commit()
-    await db.refresh(case)
-    return {"status": "success", "data": {"id": case.id}}
-
-
-@router.put("/{case_id}")
-async def update_failed_intent(
-    case_id: int,
-    req: FailedIntentUpdate,
-    db: AsyncSession = Depends(get_db_session),
-    current_user=Depends(get_current_user),
-):
-    result = await db.execute(select(FailedIntentCase).where(FailedIntentCase.id == case_id))
-    case = result.scalar_one_or_none()
-    if not case:
-        raise HTTPException(status_code=404, detail="Failed intent case not found")
-    if req.failure_reason is not None:
-        case.failure_reason = req.failure_reason
-    if req.root_cause is not None:
-        case.root_cause = req.root_cause
-    if req.resolution_notes is not None:
-        case.resolution_notes = req.resolution_notes
-    await db.commit()
-    return {"status": "success", "data": {"id": case.id}}
+    try:
+        store = get_failed_intent_store()
+        success = await store.resolve_case(
+            case_id=case_id,
+            user_clarification=req.user_clarification,
+            resolution_notes=req.resolution_notes
+        )
+        if not success:
+            raise HTTPException(status_code=404, detail="Failed intent case not found")
+        return success_response(data={"id": case_id, "resolved": True})
+    except HTTPException:
+        raise
+    except Exception as e:
+        logger.error(f"Resolve failed intent failed: {e}", exc_info=True)
+        raise HTTPException(status_code=500, detail="Internal server error")
 
 
 @router.delete("/{case_id}")
-async def delete_failed_intent(
-    case_id: int,
-    db: AsyncSession = Depends(get_db_session),
-    current_user=Depends(get_current_user),
-):
-    result = await db.execute(select(FailedIntentCase).where(FailedIntentCase.id == case_id))
-    case = result.scalar_one_or_none()
-    if not case:
-        raise HTTPException(status_code=404, detail="Failed intent case not found")
-    await db.delete(case)
-    await db.commit()
-    return {"status": "success", "message": "Deleted"}
-
-
-@router.get("/stats/summary")
-async def failed_intents_stats(
-    db: AsyncSession = Depends(get_db_session),
-    current_user=Depends(get_current_user),
-):
-    from sqlalchemy import func
-    result = await db.execute(select(func.count()).select_from(FailedIntentCase))
-    total = result.scalar() or 0
-    stage_result = await db.execute(
-        select(FailedIntentCase.failure_stage, func.count()).group_by(FailedIntentCase.failure_stage)
-    )
-    by_stage = {str(row[0].value) if row[0] else "unknown": row[1] for row in stage_result.all()}
-    return {"status": "success", "data": {"total": total, "by_stage": by_stage}}
+async def delete_failed_intent(case_id: int, current_user=Depends(get_current_user), _: None = Depends(requires_permission("intents:delete"))):
+    try:
+        store = get_failed_intent_store()
+        success = await store.delete_case(case_id)
+        if not success:
+            raise HTTPException(status_code=404, detail="Failed intent case not found")
+        return success_response()
+    except HTTPException:
+        raise
+    except Exception as e:
+        logger.error(f"Delete failed intent failed: {e}", exc_info=True)
+        raise HTTPException(status_code=500, detail="Internal server error")
